@@ -1,0 +1,21 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
+markers = [
+    "slow: 较慢的回归测试（真实引擎整篇视觉 QA），默认跳过，--run-slow 开启",
+    "e2e: 需要真实服务 / 网络 / API Key 的端到端测试，默认不随单测运行",
+]
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+respect-gitignore = true
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# 上游引擎遗留巨文件的存量问题（pdf_layout.py 归属 engine-dev，非本次测试改动范围）
+"pdf_zh_translator/pdf_layout.py" = ["F401", "F402"]

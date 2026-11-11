@@ -1,0 +1,69 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+backend/build/
+backend/dist/
+# 由 tests/test_api_dryrun.py 现场生成的样例
+backend/tests/fixtures/sample.pdf
+# 测试 / 基准 / 调试临时产物
+backend/tests/_tmp/
+backend/tests/_e2e_out/
+backend/_debug/
+backend/_batch/
+backend/_qa_debug/
+
+# ---------- Node / Vite ----------
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+yarn-error.log*
+
+# ---------- Rust / Tauri ----------
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+*.pdb
+
+# ---------- 本地构建的桌面程序 ----------
+# launcher/ 目录随仓库保留，但 exe / 快捷方式不随仓库分发
+/launcher/paperex.exe
+/launcher/*.lnk
+
+# ---------- 本地调试与批处理产物 ----------
+*.log
+
+# ---------- 凭据与环境 ----------
+.env
+.env.*
+*.key
+*.pem
+secrets.json
+backend/.env
+frontend/.env
+frontend/.env.*
+
+# ---------- 运行期导出（应用数据默认在 %APPDATA%\paperex，不在仓库内） ----------
+*.qa.json
+*.zh.pdf
+*.dual.pdf
+translation-cache.jsonl
+
+# ---------- 发布打包 ----------
+/release/
+*.zip
+*.7z
+
+# ---------- 系统 / 编辑器 ----------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

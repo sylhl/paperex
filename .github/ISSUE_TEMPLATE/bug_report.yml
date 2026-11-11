@@ -1,0 +1,117 @@
+name: Bug 报告
+description: 报告可复现的缺陷（安全漏洞请勿公开，见 SECURITY.md）
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！提交前请先搜索是否已有相同 issue。
+        **安全漏洞请通过 GitHub Security Advisories 私下报告，不要在这里公开细节。**
+        请勿粘贴 API Key 或未公开论文内容。
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索过现有 issue，没有重复
+          required: true
+        - label: 我使用的是最新版本（或已说明具体版本）
+          required: true
+        - label: 内容已脱敏，不含 API Key / 未公开论文
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: paperex 版本 / 提交
+      description: 可在设置页、README 或 git commit 中查看
+      placeholder: "例如 v1.1.0 / commit 1a2b3c4"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Linux
+        - 其他（请在下方说明）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 问题区域
+      options:
+        - 翻译质量（漏翻 / 错译 / 术语）
+        - 版式与公式（重叠 / 错位 / 丢失）
+        - QA 报告与质量循环
+        - 前端界面与阅读器
+        - 任务进度 / 取消 / 恢复
+        - 缓存
+        - 桌面壳（Tauri）与构建
+        - 文档与安装
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: 模型与 base_url
+      description: 使用的模型（如 deepseek-flash）与接口地址；不要粘贴 Key
+      placeholder: "deepseek-flash @ https://api.deepseek.com/v1"
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 尽量给出最小复现路径
+      placeholder: |
+        1. 打开…
+        2. 上传…（页数 / 是否扫描件 / 版式特点）
+        3. 质量模式设为…
+        4. 观察到…
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 可附截图；错误提示请贴完整错误码与 hint
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / qa.json 摘要（已脱敏）
+      description: 后端日志、`qa.json` 的计数与 issue code、任务响应片段
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他信息
+      description: 论文页数、版式（单/双栏、是否含公式/表格）、是否可稳定复现等
+    validations:
+      required: false

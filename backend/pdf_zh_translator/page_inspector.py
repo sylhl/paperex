@@ -1,0 +1,3750 @@
+"""Independent post-translation visual inspector.
+
+Detects the semantic-visual defect classes that density/text QA cannot see:
+
+- ``font_size_drift``: translated block set at a size inconsistent with the
+  original block it replaces (contribution bullets shrunk to 6.4pt, body
+  paragraphs shrunk to 6.5pt, ...).
+- ``list_font_inconsistent``: sibling list items rendered at diverging sizes.
+- ``preserved_ink_mismatch``: preserved table/algorithm/display-formula region
+  whose rendered ink no longer matches the original (misaligned table header
+  rules, rebuilt rows, damaged formulas).
+- ``formula_clipped``: math line whose glyph ink is cut at the rendered edge
+  (lost ascenders/superscripts of preserved formula atoms).
+- ``formula_visible_ink_mismatch``: a formula sprite exists geometrically but
+  its alpha mask contains no visible formula ink.
+- ``reference_overlap``: overprinted text inside the references section
+  (exempted from the generic text_overlap check).
+- ``reference_bold_style``: bold prose injected into references entries that
+  the original set in regular weight.
+- ``untranslated_block``: full paragraphs of English left in the translated
+  page outside preserved/figure/reference regions.
+- ``display_formula_misaligned``: displayed equation whose horizontal
+  placement drifted from the original row.
+
+Every check compares the translated page against the original page - the
+original is the ground truth for sizes, ink and placement. All issues are
+returned as :class:`pdf_zh_translator.pdf_layout.TranslationIssue` so the
+existing QA loop, sidecar reports and UI labels pick them up unchanged.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+BBox = Tuple[float, float, float, float]
+
+# Issue codes emitted by this module. The golden-page contract predates the
+# inspector and the rendering engine still exhibits these defect classes, so
+# legacy suites filter on this set while engine fixes land class by class.
+INSPECTOR_ISSUE_CODES = frozenset(
+    {
+        "font_size_drift",
+        "list_font_inconsistent",
+        "formula_clipped",
+        "formula_visible_ink_mismatch",
+        "table_structure_mismatch",
+        "preserved_ink_mismatch",
+        "reference_overlap",
+        "reference_bold_style",
+        "reference_content_changed",
+        "untranslated_block",
+        "display_formula_misaligned",
+        "text_visual_overlap",
+    }
+)
+
+_CJK_RE = re.compile(r"[\u3400-\u9fff\u3000-\u303f\uff00-\uffef]")
+_CJK_HAN_RE = re.compile(r"[\u3400-\u9fff]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+_LIST_MARKER_RE = re.compile(
+    r"^\s*(?:[\u2022\u25aa\u25e6\u2023\u00b7]|[-*]\s|\(?\d{1,2}[).]\s|\(?[ivxIVX]{1,4}\)\s)"
+)
+_MATH_FONT_RE = re.compile(
+    r"CM(MI|SY|EX|R\d)|CMSY|MSAM|MSBM|.*Math|StandardSym|"
+    r"tx(?:mi|sy|ex)|px(?:mi|sy|ex)|lm(?:mi|sy|ex|ri)|eusm|eufm",
+    re.I,
+)
+
+# Ink threshold on grayscale renders: sample < value counts as ink.
+_INK_GRAY_THRESHOLD = 205
+_INK_LUT = bytes(1 if value < _INK_GRAY_THRESHOLD else 0 for value in range(256))
+
+# font_size_drift: a block is flagged when its size ratio against the original
+# deviates from the page median ratio by more than this fraction. Dense CJK
+# reflow inside a fixed source bbox legitimately shrinks by up to ~25%.
+_SIZE_RATIO_TOLERANCE = 0.26
+_MIN_BLOCK_CJK_CHARS = 14
+# list_font_inconsistent: sibling items whose sizes differ by more than 18%.
+# CJK reflow inside fixed source bullets legitimately shrinks one long item
+# by ~10-15% while its neighbours keep the source size.
+_SIBLING_RATIO_TOLERANCE = 1.18
+# preserved_ink_mismatch: bidirectional dilated coverage below this fails.
+_PRESERVED_COVERAGE_MIN = 0.88
+_PRESERVED_MIN_AREA = 900.0  # pt^2, skip tiny atoms
+# untranslated_block: latin words needed before a CJK-free block is flagged.
+_UNTRANSLATED_MIN_WORDS = 12
+_DISPLAY_ALIGN_TOLERANCE_PT = 14.0
+_DISPLAY_ALIGN_WINDOW_PAD_PT = 48.0
+
+
+@dataclass(frozen=True)
+class _Span:
+    text: str
+    font: str
+    size: float
+    bbox: BBox
+    visible: bool = True
+
+
+@dataclass(frozen=True)
+class _Block:
+    bbox: BBox
+    spans: Tuple[_Span, ...]
+
+    @property
+    def text(self) -> str:
+        return "".join(span.text for span in self.spans)
+
+    def cjk_chars(self) -> int:
+        return sum(len(_CJK_HAN_RE.findall(span.text)) for span in self.spans)
+
+    def latin_words(self) -> int:
+        return len(_LATIN_WORD_RE.findall(self.text))
+
+    def dominant_size(self) -> float:
+        weights: Dict[float, int] = {}
+        has_cjk = self.cjk_chars() > 0
+        for span in self.spans:
+            if not span.visible:
+                continue
+            stripped = span.text.strip()
+            if not stripped:
+                continue
+            weight = (
+                len(_CJK_HAN_RE.findall(stripped))
+                if has_cjk
+                else len(stripped)
+            )
+            if weight <= 0:
+                continue
+            key = round(span.size, 2)
+            weights[key] = weights.get(key, 0) + weight
+        if not weights:
+            return 0.0
+        return max(weights, key=lambda size: (weights[size], size))
+
+    def bold_char_ratio(self) -> float:
+        total = 0
+        bold = 0
+        for span in self.spans:
+            if not span.visible:
+                continue
+            stripped = span.text.strip()
+            if not stripped:
+                continue
+            total += len(stripped)
+            if "bold" in span.font.lower():
+                bold += len(stripped)
+        return bold / total if total else 0.0
+
+
+def _issue(page: int, code: str, message: str, severity: str = "error"):
+    from .pdf_layout import TranslationIssue
+
+    return TranslationIssue(page=page, code=code, message=message, severity=severity)
+
+
+def _hidden_text_traces(page: object) -> Tuple[Tuple[BBox, str], ...]:
+    """Return coalesced render-mode 3 text runs, cached per document page."""
+    document = getattr(page, "parent", None)
+    page_number = getattr(page, "number", None)
+    cache = getattr(document, "_pdfzh_hidden_text_trace_cache", None)
+    if cache is None:
+        cache = {}
+        if document is not None:
+            try:
+                document._pdfzh_hidden_text_trace_cache = cache
+            except Exception:
+                cache = {}
+    if page_number in cache:
+        return cache[page_number]
+    hidden: List[Tuple[BBox, str]] = []
+    try:
+        for trace in page.get_texttrace():
+            bbox = trace.get("bbox")
+            if int(trace.get("type", 0)) == 3 and bbox:
+                current = tuple(float(value) for value in bbox)
+                current_text = "".join(
+                    chr(char[0]) for char in trace.get("chars", [])
+                )
+                if hidden:
+                    previous, previous_text = hidden[-1]
+                    previous_center = (previous[1] + previous[3]) / 2.0
+                    current_center = (current[1] + current[3]) / 2.0
+                    gap = current[0] - previous[2]
+                    if abs(current_center - previous_center) <= 1.5 and -0.5 <= gap <= 2.5:
+                        hidden[-1] = (
+                            (
+                                min(previous[0], current[0]),
+                                min(previous[1], current[1]),
+                                max(previous[2], current[2]),
+                                max(previous[3], current[3]),
+                            ),
+                            previous_text + current_text,
+                        )
+                        continue
+                hidden.append((current, current_text))
+    except Exception:
+        hidden = []
+    result = tuple(hidden)
+    if page_number is not None:
+        cache[page_number] = result
+    return result
+
+
+def _page_text_dict(page: object) -> dict:
+    """Per-document cache of ``page.get_text("dict")``.
+
+    QA walks every drawn frame on a page and re-extracts its text each time;
+    on vector-heavy figures (bar charts, diagrams) that turned one page into
+    hundreds of identical extractions and stalled the whole inspection.
+    """
+    document = getattr(page, "parent", None)
+    page_number = getattr(page, "number", None)
+    cache = getattr(document, "_pdfzh_text_dict_cache", None)
+    if cache is None:
+        cache = {}
+        if document is not None:
+            try:
+                document._pdfzh_text_dict_cache = cache
+            except Exception:
+                cache = {}
+    if page_number in cache:
+        return cache[page_number]
+    data = page.get_text("dict")
+    if page_number is not None:
+        cache[page_number] = data
+    return data
+
+
+def _text_blocks(page: object) -> List[_Block]:
+    hidden_text_traces = _hidden_text_traces(page)
+    blocks: List[_Block] = []
+    for raw in _page_text_dict(page).get("blocks", []):
+        if raw.get("type") != 0:
+            continue
+        spans: List[_Span] = []
+        for line in raw.get("lines", []):
+            for span in line.get("spans", []):
+                if not span.get("text"):
+                    continue
+                span_bbox = tuple(float(v) for v in span["bbox"])
+                span_area = _bbox_area(span_bbox)
+                hidden = bool(
+                    span_area > 0.0
+                    and any(
+                        span["text"] == hidden_text
+                        and _bbox_overlap_area(span_bbox, hidden_bbox)
+                        >= 0.8 * _bbox_area(hidden_bbox)
+                        for hidden_bbox, hidden_text in hidden_text_traces
+                    )
+                )
+                spans.append(
+                    _Span(
+                        text=span["text"],
+                        font=str(span.get("font", "")),
+                        size=float(span.get("size", 0.0)),
+                        bbox=span_bbox,
+                        visible=not hidden,
+                    )
+                )
+        if spans:
+            blocks.append(
+                _Block(
+                    bbox=tuple(float(v) for v in raw["bbox"]),
+                    spans=tuple(spans),
+                )
+            )
+    return blocks
+
+
+def _bbox_overlap_area(a: BBox, b: BBox) -> float:
+    width = min(a[2], b[2]) - max(a[0], b[0])
+    height = min(a[3], b[3]) - max(a[1], b[1])
+    if width <= 0.0 or height <= 0.0:
+        return 0.0
+    return width * height
+
+
+def _bbox_area(bbox: BBox) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _bbox_intersects(a: BBox, b: BBox, *, margin: float = 0.0) -> bool:
+    return (
+        a[0] - margin < b[2]
+        and b[0] - margin < a[2]
+        and a[1] - margin < b[3]
+        and b[1] - margin < a[3]
+    )
+
+
+class _PageInk:
+    """Single full-page grayscale ink bitmap with windowed queries.
+
+    Rendering once per page (instead of once per probed clip) matters on
+    raster-heavy documents where every ``get_pixmap`` call re-decodes large
+    background images.
+    """
+
+    def __init__(self, page: object, *, zoom: float = 3.0) -> None:
+        import fitz
+
+        self.zoom = zoom
+        self.origin_x = float(page.rect.x0)
+        self.origin_y = float(page.rect.y0)
+        pixmap = page.get_pixmap(
+            matrix=fitz.Matrix(zoom, zoom),
+            colorspace=fitz.csGRAY,
+            alpha=False,
+        )
+        self.width = pixmap.width
+        self.height = pixmap.height
+        self.flags = pixmap.samples.translate(_INK_LUT)
+
+    def _window(self, bbox: BBox) -> Optional[Tuple[int, int, int, int]]:
+        x0 = max(0, int((bbox[0] - self.origin_x) * self.zoom))
+        y0 = max(0, int((bbox[1] - self.origin_y) * self.zoom))
+        x1 = min(self.width, int((bbox[2] - self.origin_x) * self.zoom) + 1)
+        y1 = min(self.height, int((bbox[3] - self.origin_y) * self.zoom) + 1)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
+        return x0, y0, x1, y1
+
+    def row_profile(self, bbox: BBox) -> List[float]:
+        window = self._window(bbox)
+        if window is None:
+            return []
+        x0, y0, x1, y1 = window
+        span = x1 - x0
+        profile: List[float] = []
+        for y in range(y0, y1):
+            row = self.flags[y * self.width + x0 : y * self.width + x1]
+            profile.append(row.count(1) / span)
+        return profile
+
+    def mask(
+        self,
+        bbox: BBox,
+        *,
+        columns: int,
+        rows: int,
+        exclude_bands: Sequence[Tuple[float, float]] = (),
+    ) -> Optional[set]:
+        window = self._window(bbox)
+        if window is None:
+            return None
+        x0, y0, x1, y1 = window
+        span_x = x1 - x0
+        span_y = y1 - y0
+        banned_rows = set()
+        for band_y0, band_y1 in exclude_bands:
+            top = max(0, int((band_y0 - self.origin_y) * self.zoom) - y0)
+            bottom = min(span_y, int((band_y1 - self.origin_y) * self.zoom) - y0 + 1)
+            banned_rows.update(range(max(0, top), max(0, bottom)))
+        mask = set()
+        stride = max(1, span_x // (columns * 2))
+        for y_offset in range(span_y):
+            if y_offset in banned_rows:
+                continue
+            y = y0 + y_offset
+            row = self.flags[y * self.width + x0 : y * self.width + x1]
+            if 1 not in row:
+                continue
+            start = 0
+            while True:
+                index = row.find(1, start)
+                if index < 0:
+                    break
+                mask.add(
+                    (
+                        min(columns - 1, index * columns // span_x),
+                        min(rows - 1, y_offset * rows // span_y),
+                    )
+                )
+                start = index + stride
+        return mask
+
+    def centroid_x(self, bbox: BBox) -> Optional[float]:
+        window = self._window(bbox)
+        if window is None:
+            return None
+        x0, y0, x1, y1 = window
+        weighted = 0
+        total = 0
+        for y in range(y0, y1):
+            row = self.flags[y * self.width + x0 : y * self.width + x1]
+            start = 0
+            while True:
+                index = row.find(1, start)
+                if index < 0:
+                    break
+                weighted += index
+                total += 1
+                start = index + 1
+        if not total:
+            return None
+        return self.origin_x + (x0 + weighted / total) / self.zoom
+
+
+class _InkCache:
+    """Lazy per-page ink bitmaps so text-only checks never render."""
+
+    def __init__(self, page: object) -> None:
+        self._page = page
+        self._ink: Optional[_PageInk] = None
+
+    def get(self) -> _PageInk:
+        if self._ink is None:
+            self._ink = _PageInk(self._page)
+        return self._ink
+
+
+def _dilate(mask: set, columns: int, rows: int) -> set:
+    return {
+        (x + dx, y + dy)
+        for x, y in mask
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        if 0 <= x + dx < columns and 0 <= y + dy < rows
+    }
+
+
+def _mask_coverage(source: set, translated: set, columns: int, rows: int) -> float:
+    if not source and not translated:
+        return 1.0
+    if not source or not translated:
+        return 0.0
+    source_hit = len(source & _dilate(translated, columns, rows)) / len(source)
+    translated_hit = len(translated & _dilate(source, columns, rows)) / len(translated)
+    return min(source_hit, translated_hit)
+
+
+
+
+# ---------------------------------------------------------------------------
+# font size checks
+# ---------------------------------------------------------------------------
+
+
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    count = len(ordered)
+    if not count:
+        return 0.0
+    middle = count // 2
+    if count % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _dominant_span_size_in_bbox(block: _Block, bbox: BBox) -> float:
+    """Return the dominant visible span size inside one source style role."""
+    overlapping: List[_Span] = []
+    for span in block.spans:
+        if not span.visible:
+            continue
+        span_area = _bbox_area(span.bbox)
+        if span_area <= 0.0:
+            continue
+        if _bbox_overlap_area(span.bbox, bbox) < 0.45 * span_area:
+            continue
+        overlapping.append(span)
+    cjk_spans = [span for span in overlapping if _CJK_HAN_RE.search(span.text)]
+    measured_spans = cjk_spans or overlapping
+    weights: Dict[float, int] = {}
+    for span in measured_spans:
+        size = round(float(span.size), 2)
+        weights[size] = weights.get(size, 0) + max(len(span.text.strip()), 1)
+    if not weights:
+        return 0.0
+    return max(weights, key=lambda size: (weights[size], size))
+
+
+def _tight_visual_regions(page: object, regions: Sequence[BBox]) -> List[BBox]:
+    """Shrink merged graphic envelopes to actual drawing/image extents.
+
+    ``collect_graphic_regions`` merges nearby candidates and pads the result,
+    so a figure envelope can extend across the following prose rows. The
+    overlap detector must compare against the painted figure footprint.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return [tuple(region) for region in regions]
+    page_rect = page.rect
+    elements = []
+    try:
+        for info in page.get_image_info(xrefs=True):
+            rect = fitz.Rect(info["bbox"])
+            if rect.is_valid and not rect.is_empty:
+                elements.append(rect)
+    except Exception:
+        pass
+    for drawing in page.get_drawings():
+        rect = drawing.get("rect")
+        if not isinstance(rect, fitz.Rect) or rect.is_empty:
+            continue
+        if rect.width >= page_rect.width * 0.9 and rect.height <= 3.0:
+            continue
+        if rect.height >= page_rect.height * 0.9:
+            continue
+        fill = drawing.get("fill")
+        stroke = drawing.get("color")
+        if (
+            fill is not None
+            and all(float(channel) >= 0.98 for channel in fill)
+            and (stroke is None or all(float(channel) >= 0.98 for channel in stroke))
+        ):
+            # White figure canvases / page panels are not visible ink.
+            continue
+        if (rect.height <= 1.0 and rect.width > 20.0) or (
+            rect.width <= 1.0 and rect.height > 20.0
+        ):
+            # Rules and column separators carry no figure ink.
+            continue
+        elements.append(rect)
+    output: List[BBox] = []
+    for region in regions:
+        box = fitz.Rect(region)
+        hits = [rect for rect in elements if box.intersects(rect)]
+        if not hits:
+            output.append(tuple(region))
+            continue
+        tight = hits[0]
+        for rect in hits[1:]:
+            tight |= rect
+        output.append((tight.x0, tight.y0, tight.x1, tight.y1))
+    return output
+
+
+def _text_visual_overlap_issues(
+    original_page: object,
+    translated_page: object,
+    page_number: int,
+    *,
+    original_visual_regions: Sequence[BBox] = (),
+    translated_visual_regions: Sequence[BBox] = (),
+    caption_regions: Sequence[BBox] = (),
+    preserved_regions: Sequence[BBox] = (),
+    table_bands: Sequence[BBox] = (),
+) -> List[object]:
+    """Detect translated body text newly painted over figure/image regions."""
+    if not original_visual_regions or not translated_visual_regions:
+        return []
+
+    def intersection(left: BBox, right: BBox) -> Optional[BBox]:
+        box = (
+            max(left[0], right[0]),
+            max(left[1], right[1]),
+            min(left[2], right[2]),
+            min(left[3], right[3]),
+        )
+        return box if box[2] > box[0] and box[3] > box[1] else None
+
+    def area(box: BBox) -> float:
+        return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+    def page_text_spans(page: object) -> List[dict]:
+        spans: List[dict] = []
+        for block in _page_text_dict(page).get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                text_parts: List[str] = []
+                boxes: List[BBox] = []
+                for span in line.get("spans", []):
+                    text = str(span.get("text", ""))
+                    bbox = span.get("bbox")
+                    if text.strip() and bbox is not None and len(bbox) == 4:
+                        text_parts.append(text)
+                        boxes.append(tuple(float(value) for value in bbox))
+                if not boxes:
+                    continue
+                # CJK tracking is drawn glyph by glyph, so PyMuPDF can report
+                # one span per glyph. Overlap is a line-level property; using
+                # glyph boxes marks nearly every glyph as fully inside a
+                # figure region.
+                spans.append(
+                    {
+                        "text": "".join(text_parts),
+                        "bbox": (
+                            min(box[0] for box in boxes),
+                            min(box[1] for box in boxes),
+                            max(box[2] for box in boxes),
+                            max(box[3] for box in boxes),
+                        ),
+                    }
+                )
+        return spans
+
+    source_anchors: List[Tuple[BBox, BBox]] = []
+    for span in page_text_spans(original_page):
+        text = str(span.get("text", "")).strip()
+        raw_bbox = span.get("bbox")
+        if not text or not raw_bbox:
+            continue
+        source_bbox = tuple(float(value) for value in raw_bbox)
+        source_area = area(source_bbox)
+        if source_area <= 0.0:
+            continue
+        for region in original_visual_regions:
+            region_box = tuple(float(value) for value in region)
+            overlap = intersection(source_bbox, region_box)
+            if overlap is not None and area(overlap) / source_area >= 0.20:
+                source_anchors.append((source_bbox, region_box))
+
+    issues: List[object] = []
+    for span in page_text_spans(translated_page):
+        text = " ".join(str(span.get("text", "")).split())
+        raw_bbox = span.get("bbox")
+        if not text or not raw_bbox or not _CJK_HAN_RE.search(text):
+            continue
+        target_bbox = tuple(float(value) for value in raw_bbox)
+        target_area = area(target_bbox)
+        if target_area <= 0.0:
+            continue
+        tx = (target_bbox[0] + target_bbox[2]) / 2.0
+        ty = (target_bbox[1] + target_bbox[3]) / 2.0
+        if any(
+            box[0] - 2.0 <= tx <= box[2] + 2.0
+            and box[1] - 2.0 <= ty <= box[3] + 2.0
+            for box in caption_regions
+        ):
+            # Captions sit inside the caption band attached to their float;
+            # translating them is required, not an overlap defect.
+            continue
+        # Text deliberately written inside a preserved table / algorithm /
+        # designed-English region (or inside a structural table band) is not
+        # painted over a figure: the inspector already treats those regions as
+        # verbatim-owned material elsewhere.  Without this exemption a table
+        # block under a full-page figure envelope is reported as 100% overlap
+        # even though translating it is correct (DeepSeek-V4 p31).
+        preserved_area = sum(
+            area(overlap)
+            for region in preserved_regions
+            if (overlap := intersection(target_bbox, tuple(float(value) for value in region)))
+            is not None
+        )
+        if target_area > 0.0 and preserved_area / target_area >= 0.5:
+            continue
+        if any(
+            float(band[0]) - 2.0 <= tx <= float(band[2]) + 2.0
+            and float(band[1]) - 2.0 <= ty <= float(band[3]) + 2.0
+            for band in table_bands
+        ):
+            continue
+        # A translated line that replaces source prose at the same place is a
+        # normal redaction/reflow, not new ink painted over the figure: the
+        # source anchor already owned that footprint inside the figure
+        # envelope (DeepSeek-V4 p31 prompt text translated in place).  The
+        # size/center heuristic below only matches identical bands; a reflowed
+        # line can be shorter or taller than its source line, so also match by
+        # footprint overlap before reporting.
+        for source_bbox, _source_region_box in source_anchors:
+            source_hit = intersection(target_bbox, source_bbox)
+            if source_hit is None:
+                continue
+            source_area = max(area(source_bbox), 1.0)
+            if area(source_hit) / target_area >= 0.30 or area(source_hit) / source_area >= 0.60:
+                break
+        else:
+            source_hit = None
+        if source_hit is not None:
+            continue
+        # Short chart labels (axis ticks, legends) are legitimately translated
+        # in place and cannot be judged as flowing prose over a figure.
+        compact = "".join(text.split())
+        if len(compact) <= 16 and not re.search(r"[，。；：！？,.;:!?]", compact):
+            continue
+        for target_region in translated_visual_regions:
+            target_region_box = tuple(float(value) for value in target_region)
+            # Native formula stamps also become image regions in the output.
+            # This detector owns the original figure footprint; formula/ink
+            # collisions have separate checks. Intersect both observations so
+            # split images still count, without treating new math as a figure.
+            shared_regions = [
+                shared
+                for source_region in original_visual_regions
+                if (shared := intersection(target_region_box, tuple(source_region))) is not None
+            ]
+            overlaps = [
+                hit for shared in shared_regions
+                if (hit := intersection(target_bbox, shared)) is not None
+            ]
+            overlap = max(overlaps, key=area, default=None)
+            if overlap is None:
+                continue
+            overlap_area = area(overlap)
+            if overlap_area / target_area < 0.12 or overlap[3] - overlap[1] < 1.0:
+                continue
+            region_w = max(1.0, target_region_box[2] - target_region_box[0])
+            region_h = max(1.0, target_region_box[3] - target_region_box[1])
+            preserved_source_text = False
+            for source_bbox, source_region_box in source_anchors:
+                source_width = max(1.0, source_region_box[2] - source_region_box[0])
+                source_height = max(1.0, source_region_box[3] - source_region_box[1])
+                if abs(source_width - region_w) > max(20.0, 0.25 * region_w):
+                    continue
+                if abs(source_height - region_h) > max(20.0, 0.25 * region_h):
+                    continue
+                sx = (source_bbox[0] + source_bbox[2]) / 2.0
+                sy = (source_bbox[1] + source_bbox[3]) / 2.0
+                if (
+                    abs(sx - tx) <= max(8.0, 0.10 * region_w)
+                    and abs(sy - ty) <= max(8.0, 0.10 * region_h)
+                ):
+                    preserved_source_text = True
+                    break
+            if preserved_source_text:
+                continue
+            issues.append(
+                _issue(
+                    page_number,
+                    "text_visual_overlap",
+                    (
+                        f"Page {page_number}: translated text overlaps a figure/image "
+                        f"region by {overlap_area / target_area:.0%} at "
+                        f"x={overlap[0]:.1f}, y={overlap[1]:.1f}: {text[:80]}"
+                    ),
+                    severity="warning",
+                )
+            )
+            if len(issues) >= 4:
+                return issues
+            break
+    return issues
+
+
+def _font_size_issues(
+    original_page: object,
+    translated_page: object,
+    page_number: int,
+    *,
+    exclusion_bboxes: Sequence[BBox],
+    source_role_blocks: Sequence[object] = (),
+) -> List[object]:
+    original_blocks = [block for block in _text_blocks(original_page) if block.dominant_size() > 0]
+    translated_blocks = _text_blocks(translated_page)
+
+    candidates: List[Tuple[_Block, float, float, str]] = []  # block, size, expected, role
+    for block in translated_blocks:
+        if block.cjk_chars() < _MIN_BLOCK_CJK_CHARS:
+            continue
+        if _LIST_MARKER_RE.match(block.text) or block.text.lstrip()[:1] in "）)，,、":
+            # List items (and their wrapped continuation rows) are re-typeset
+            # as one sibling group; their shared size is validated by
+            # _sibling_list_issues, not against body text.
+            continue
+        if page_number == 1 and re.search(r"USENIX|Proceedings|Symposium", block.text):
+            continue
+        if block.bold_char_ratio() > 0.5:
+            continue
+        if any(
+            _bbox_overlap_area(block.bbox, banned) > 0.35 * _bbox_area(block.bbox)
+            for banned in exclusion_bboxes
+        ):
+            continue
+        size = block.dominant_size()
+        if size <= 0:
+            continue
+        area = _bbox_area(block.bbox)
+        if area <= 0:
+            continue
+        # Pair by symmetric (Dice-style) bbox similarity. Raw overlap area
+        # lets a page-wide extraction artefact swallow every caption inside
+        # it; plain source-coverage lets a tiny embedded formula block win
+        # against the true paragraph. overlap^2/(area*source_area) prefers
+        # the source that mutually matches the translated block best.
+        best_overlap = 0.0
+        best_score = 0.0
+        expected = 0.0
+        expected_role = ""
+        expected_bbox: Optional[BBox] = None
+        for source in source_role_blocks:
+            source_bbox = tuple(float(value) for value in source.bbox)
+            overlap = _bbox_overlap_area(block.bbox, source_bbox)
+            if overlap <= 0.25 * area:
+                continue
+            source_area = _bbox_area(source_bbox)
+            if source_area <= 0:
+                continue
+            score = (overlap * overlap) / (area * source_area)
+            if score > best_score:
+                best_score = score
+                best_overlap = overlap
+                expected = float(source.font_size)
+                expected_bbox = source_bbox
+                expected_role = str(getattr(source, "block_type", ""))
+        for source in original_blocks:
+            overlap = _bbox_overlap_area(block.bbox, source.bbox)
+            if overlap <= 0.25 * area:
+                continue
+            source_area = _bbox_area(source.bbox)
+            if source_area <= 0:
+                continue
+            score = (overlap * overlap) / (area * source_area)
+            if score > best_score:
+                best_score = score
+                best_overlap = overlap
+                expected = source.dominant_size()
+                expected_bbox = source.bbox
+        if best_overlap <= 0.25 * area or expected <= 0:
+            continue
+        if expected >= 14.0:
+            # Cover titles follow the global 0.90 font scale by design.
+            continue
+        if expected < 8.5:
+            # Footnotes, table notes and small print legitimately compact.
+            continue
+        if expected_role in {
+            "table",
+            "table_prose",
+            "equation",
+            "algorithm",
+            "footnote",
+        }:
+            # Table cells, formula rows and footnotes legitimately shrink to
+            # fit a fixed source envelope; the grid itself is the contract.
+            continue
+        if expected_role in {"title", "metadata", "header", "footer"}:
+            # Cover/venue/title lines follow the global font scale instead
+            # of the body cohort; comparing them to body ratios is invalid.
+            continue
+        if expected_bbox is not None:
+            role_local_size = _dominant_span_size_in_bbox(block, expected_bbox)
+            if role_local_size > 0.0:
+                size = role_local_size
+        candidates.append((block, size, expected, expected_role))
+
+    if len(candidates) < 3:
+        return []
+    ratios = [size / expected for _, size, expected, _ in candidates]
+    median_ratio = _median(ratios)
+    if median_ratio <= 0:
+        return []
+    cohorts: Dict[Tuple[str, float], List[float]] = {}
+    for _, size, expected, role in candidates:
+        cohorts.setdefault((role, round(expected, 1)), []).append(size / expected)
+
+    issues: List[object] = []
+    for block, size, expected, role in candidates:
+        ratio = size / expected
+        # Only the shrink direction is a reader-visible defect (crushed
+        # bullets/paragraphs); a block that keeps its size while its source
+        # ran slightly smaller still renders uniform with its neighbours.
+        # Judge against the block's own expectation cohort: pages mixing
+        # run-in headings (14.4pt sources) with body prose (12.1pt sources)
+        # render both at one uniform Chinese size, so their ratios form two
+        # healthy modes and the page-wide median would flag whichever mode
+        # loses (dreamerv3 appendix). A cohort that is itself crushed still
+        # fails the absolute floor.
+        # The same source size can belong to different typography roles. A
+        # title that keeps its original size must not inherit body-font growth.
+        # A singleton has no peer evidence: cap the page reference at the source
+        # scale (1.0), while keeping genuine shrinkage and existing floors live.
+        cohort = cohorts[(role, round(expected, 1))]
+        reference = (
+            min(_median(cohort), median_ratio) if len(cohort) >= 2 else min(1.0, median_ratio)
+        )
+        uniform_with_cohort = ratio >= reference - _SIZE_RATIO_TOLERANCE * reference
+        cohort_itself_crushed = reference < 0.80 and ratio < 0.72
+        if uniform_with_cohort and not cohort_itself_crushed:
+            continue
+        issues.append(
+            _issue(
+                page_number,
+                "font_size_drift",
+                (
+                    f"Page {page_number}: block set at {size:.2f}pt but the "
+                    f"original at this position is {expected:.2f}pt "
+                    f"(ratio {ratio:.2f} vs page median {median_ratio:.2f}) at "
+                    f"x={block.bbox[0]:.1f}, y={block.bbox[1]:.1f}: "
+                    f"{' '.join(block.text.split())[:48]}"
+                ),
+            )
+        )
+        if len(issues) >= 4:
+            break
+
+    issues.extend(_sibling_list_issues(translated_blocks, page_number, exclusion_bboxes))
+    return issues
+
+
+def _sibling_list_issues(
+    translated_blocks: Sequence[_Block],
+    page_number: int,
+    exclusion_bboxes: Sequence[BBox],
+) -> List[object]:
+    """Sibling list items (same marker style, same column) with size drift."""
+    groups: Dict[Tuple[str, int], List[Tuple[_Block, float]]] = {}
+    for block in translated_blocks:
+        if block.cjk_chars() < _MIN_BLOCK_CJK_CHARS:
+            continue
+        if any(
+            _bbox_overlap_area(block.bbox, banned) > 0.35 * _bbox_area(block.bbox)
+            for banned in exclusion_bboxes
+        ):
+            continue
+        match = _LIST_MARKER_RE.match(block.text)
+        if not match:
+            continue
+        marker = match.group(0).strip()
+        style = "digit" if any(ch.isdigit() for ch in marker) else marker[:1]
+        column = int(block.bbox[0] // 24)
+        size = block.dominant_size()
+        if size <= 0:
+            continue
+        groups.setdefault((style, column), []).append((block, size))
+
+    issues: List[object] = []
+    for (style, _column), members in groups.items():
+        if len(members) < 2:
+            continue
+        sizes = [size for _, size in members]
+        largest, smallest = max(sizes), min(sizes)
+        if smallest <= 0 or largest / smallest <= _SIBLING_RATIO_TOLERANCE:
+            continue
+        offender = min(members, key=lambda item: item[1])[0]
+        issues.append(
+            _issue(
+                page_number,
+                "list_font_inconsistent",
+                (
+                    f"Page {page_number}: sibling list items ('{style}' markers) "
+                    f"render at {smallest:.2f}-{largest:.2f}pt "
+                    f"(x{largest / smallest:.2f} spread) at "
+                    f"x={offender.bbox[0]:.1f}, y={offender.bbox[1]:.1f}: "
+                    f"{' '.join(offender.text.split())[:48]}"
+                ),
+            )
+        )
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# preserved regions / formulas
+# ---------------------------------------------------------------------------
+
+
+def _preserved_region_issues(
+    original_ink: _InkCache,
+    translated_ink: _InkCache,
+    page_number: int,
+    regions: Sequence[BBox],
+    caption_bands: Sequence[BBox],
+) -> List[object]:
+    issues: List[object] = []
+    flagged = 0
+    for region in regions:
+        if _bbox_area(region) < _PRESERVED_MIN_AREA:
+            continue
+        # Running headers sit in the top margin band and are legitimately
+        # translated even when region extraction labels them preserved.
+        if region[3] <= 48.0 and (region[3] - region[1]) <= 16.0:
+            continue
+        bands = [
+            (band[1] - 2.0, band[3] + 2.0)
+            for band in caption_bands
+            if _bbox_intersects(region, band)
+        ]
+        width = max(1.0, region[2] - region[0])
+        height = max(1.0, region[3] - region[1])
+        columns = max(24, min(128, int(width / 4)))
+        rows = max(12, min(96, int(height / 4)))
+        source_mask = original_ink.get().mask(
+            region, columns=columns, rows=rows, exclude_bands=bands
+        )
+        translated_mask = translated_ink.get().mask(
+            region, columns=columns, rows=rows, exclude_bands=bands
+        )
+        if source_mask is None or translated_mask is None:
+            continue
+        if not source_mask:
+            continue
+        coverage = _mask_coverage(source_mask, translated_mask, columns, rows)
+        if coverage >= _PRESERVED_COVERAGE_MIN:
+            continue
+        issues.append(
+            _issue(
+                page_number,
+                "preserved_ink_mismatch",
+                (
+                    f"Page {page_number}: preserved region at "
+                    f"x={region[0]:.0f}, y={region[1]:.0f} "
+                    f"({region[2] - region[0]:.0f}x{region[3] - region[1]:.0f}pt) "
+                    f"renders with ink coverage {coverage:.2f} vs original"
+                ),
+            )
+        )
+        flagged += 1
+        if flagged >= 4:
+            break
+    return issues
+
+
+def _edge_cut(profile: List[float], first: int, second: int) -> bool:
+    """Partial glyph ink on the outermost rendered rows.
+
+    Full-width rows (>0.85) are rules (fraction bars, cmidrules) that
+    legitimately sit on the line boundary and must not count as clipping.
+    """
+    return (
+        0.03 < profile[first] <= 0.85
+        and 0.03 < profile[second] <= 0.85
+    )
+
+
+_SPRITE_MAX_HEIGHT_PT = 34.0
+_SPRITE_MIN_WIDTH_PT = 8.0
+_SPRITE_MAX_INK = 0.42
+_SPRITE_EDGE_MIN = 0.05
+_SPRITE_BLOCKING_EDGE_MIN = 0.12
+_MASK_OPACITY_MIN = 16
+
+
+def _image_mask_row_profile(raw: dict) -> Optional[List[float]]:
+    """Return per-row opacity density for an image's own alpha mask."""
+    mask = raw.get("mask")
+    if not isinstance(mask, bytes) or not mask:
+        return None
+    try:
+        import fitz
+
+        pixmap = fitz.Pixmap(mask)
+    except Exception:
+        return None
+    if pixmap.width <= 0 or pixmap.height <= 0 or pixmap.n <= 0:
+        return None
+    samples = pixmap.samples
+    profile: List[float] = []
+    for row in range(pixmap.height):
+        start = row * pixmap.stride
+        pixels = samples[start : start + pixmap.width * pixmap.n : pixmap.n]
+        profile.append(
+            sum(value >= _MASK_OPACITY_MIN for value in pixels) / pixmap.width
+        )
+    return profile
+def _edge_is_decoration_bar(profile: Sequence[float], *, from_top: bool) -> bool:
+    """Dense edge rows followed by a whitespace gap: an overline/underline."""
+    rows = list(profile) if from_top else list(reversed(profile))
+    if len(rows) < 5:
+        return False
+    edge = min(rows[0], rows[1])
+    if edge < 0.35:
+        return False
+    return min(rows[2:5]) <= 0.06
+
+
+def _math_clip_issues(
+    original_page: object,
+    original_ink: _InkCache,
+    translated_page: object,
+    translated_ink: _InkCache,
+    page_number: int,
+) -> List[object]:
+    """Inline formula sprites whose glyph ink is cut at the sprite edge.
+
+    The engine rasterises prose rows that carry inline formulas into small
+    image sprites (~8-12pt tall). A too-tight crop cuts ascenders,
+    superscripts or descenders, which shows up as ink on the outermost
+    pixel rows of the sprite; intact sprites keep a clean margin.
+    Real figures are excluded by the height/ink limits, and image tiles
+    that keep their source position (fragments of preserved diagrams,
+    which have edge ink by design) are exempt: formula sprites are stamped
+    at reflowed positions, so they never coincide with a source image.
+    """
+    source_images = [
+        tuple(float(v) for v in raw["bbox"])
+        for raw in _page_text_dict(original_page).get("blocks", [])
+        if raw.get("type") == 1
+    ]
+    issues: List[object] = []
+    checked = 0
+    for raw in _page_text_dict(translated_page).get("blocks", []):
+        if raw.get("type") != 1:
+            continue
+        bbox = tuple(float(v) for v in raw["bbox"])
+        height = bbox[3] - bbox[1]
+        width = bbox[2] - bbox[0]
+        if height <= 3.0 or height > _SPRITE_MAX_HEIGHT_PT:
+            continue
+        if width < _SPRITE_MIN_WIDTH_PT:
+            continue
+        area = max(1.0, width * height)
+        if any(
+            _bbox_overlap_area(bbox, source) >= 0.5 * area
+            for source in source_images
+        ):
+            continue
+        # Vector diagrams restored in place (redaction repair) have no
+        # source image block; recognise them by unchanged source ink.
+        columns = max(12, min(96, int(width / 2)))
+        rows = max(8, min(64, int(height / 2)))
+        source_mask = original_ink.get().mask(bbox, columns=columns, rows=rows)
+        translated_mask = translated_ink.get().mask(bbox, columns=columns, rows=rows)
+        if (
+            source_mask
+            and translated_mask
+            and _mask_coverage(source_mask, translated_mask, columns, rows) >= 0.75
+        ):
+            continue
+        checked += 1
+        if checked > 120:
+            break
+        # Page-raster sampling includes foreign text and rules that happen to
+        # overlap the image bbox. Formula sprites carry an alpha mask, which
+        # is the exact glyph silhouette and therefore the authoritative clip
+        # signal. Old/external images without a mask retain the raster fallback.
+        profile = _image_mask_row_profile(raw)
+        if profile is None:
+            profile = translated_ink.get().row_profile(bbox)
+        if len(profile) < 8:
+            continue
+        mean_ink = sum(profile) / len(profile)
+        if raw.get("mask") and mean_ink < 0.001:
+            issues.append(
+                _issue(
+                    page_number,
+                    "formula_visible_ink_mismatch",
+                    (
+                        f"Page {page_number}: inline formula sprite at "
+                        f"x={bbox[0]:.1f}, y={bbox[1]:.1f} "
+                        f"({width:.0f}x{height:.0f}pt) has no visible ink"
+                    ),
+                )
+            )
+            if len(issues) >= 5:
+                break
+            continue
+        if not 0.01 <= mean_ink <= _SPRITE_MAX_INK:
+            continue
+        top = min(profile[0], profile[1])
+        bottom = min(profile[-1], profile[-2])
+        top_cut = _SPRITE_EDGE_MIN <= top <= 0.85
+        bottom_cut = _SPRITE_EDGE_MIN <= bottom <= 0.85
+        # Overlined and underlined symbols (Ā, x̲) carry a solid stroke at
+        # the sprite boundary by design: a dense edge followed by a
+        # whitespace gap before the glyph body is decoration, not a cut.
+        # Sliced glyphs leave fragmentary edge ink (well under bar density)
+        # or continue straight into the body without any gap.
+        if top_cut and _edge_is_decoration_bar(profile, from_top=True):
+            top_cut = False
+        if bottom_cut and _edge_is_decoration_bar(profile, from_top=False):
+            bottom_cut = False
+        if not top_cut and not bottom_cut:
+            continue
+        edge = "top" if top_cut else "bottom"
+        edge_density = top if top_cut else bottom
+        issues.append(
+            _issue(
+                page_number,
+                "formula_clipped",
+                (
+                    f"Page {page_number}: inline formula sprite at "
+                    f"x={bbox[0]:.1f}, y={bbox[1]:.1f} "
+                    f"({width:.0f}x{height:.0f}pt) has ink cut at its {edge} "
+                    f"edge (density {edge_density:.2f})"
+                ),
+                severity=(
+                    "error"
+                    if edge_density >= _SPRITE_BLOCKING_EDGE_MIN
+                    else "warning"
+                ),
+            )
+        )
+        if len(issues) >= 5:
+            break
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# table structure
+# ---------------------------------------------------------------------------
+
+
+def _page_line_art(
+    page: object,
+) -> Tuple[List[Tuple[float, float, float]], List[float]]:
+    """Horizontal rules (y, x0, x1) plus y-centres of bezier curve items.
+
+    Curves are how plot lines are drawn; their presence around a rule
+    cluster marks a chart frame rather than a table grid. Dashed rules are
+    chart gridlines, never table rules, and are dropped at the source.
+    """
+    rules: List[Tuple[float, float, float]] = []
+    curves: List[float] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return rules, curves
+    for drawing in drawings:
+        dashes = drawing.get("dashes")
+        dashed = bool(dashes) and dashes not in ("", "[] 0")
+        for item in drawing.get("items", []):
+            kind = item[0]
+            if kind == "l":
+                if dashed:
+                    continue
+                p1, p2 = item[1], item[2]
+                if abs(p1.y - p2.y) <= 0.6 and abs(p2.x - p1.x) >= 40.0:
+                    rules.append(
+                        (
+                            round((p1.y + p2.y) / 2.0, 1),
+                            min(p1.x, p2.x),
+                            max(p1.x, p2.x),
+                        )
+                    )
+            elif kind == "re":
+                if dashed:
+                    continue
+                rect = item[1]
+                if rect.height <= 1.6 and rect.width >= 40.0:
+                    rules.append((round((rect.y0 + rect.y1) / 2.0, 1), rect.x0, rect.x1))
+            elif kind == "c":
+                curves.append(float(item[1].y))
+    merged: Dict[float, Tuple[float, float]] = {}
+    for y, x0, x1 in rules:
+        if y in merged:
+            merged[y] = (min(merged[y][0], x0), max(merged[y][1], x1))
+        else:
+            merged[y] = (x0, x1)
+    return sorted((y, x0, x1) for y, (x0, x1) in merged.items()), curves
+
+
+def _page_vertical_lines(page: object) -> List[Tuple[float, float, float]]:
+    """Vertical line segments (x, y0, y1) at least 24pt tall.
+
+    Academic tables draw horizontal rules only; vertical edges around a
+    rule cluster mean plot frames or legend boxes.
+    """
+    verticals: List[Tuple[float, float, float]] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return verticals
+    for drawing in drawings:
+        for item in drawing.get("items", []):
+            kind = item[0]
+            if kind == "l":
+                p1, p2 = item[1], item[2]
+                if abs(p1.x - p2.x) <= 0.6 and abs(p2.y - p1.y) >= 24.0:
+                    verticals.append(
+                        (
+                            (p1.x + p2.x) / 2.0,
+                            min(p1.y, p2.y),
+                            max(p1.y, p2.y),
+                        )
+                    )
+            elif kind == "re":
+                rect = item[1]
+                if rect.width <= 1.6 and rect.height >= 24.0:
+                    verticals.append(((rect.x0 + rect.x1) / 2.0, rect.y0, rect.y1))
+                elif rect.width >= 40.0 and rect.height >= 24.0:
+                    # A stroked rectangle frame contributes its side edges.
+                    verticals.append((rect.x0, rect.y0, rect.y1))
+                    verticals.append((rect.x1, rect.y0, rect.y1))
+    return verticals
+
+
+def _rule_clusters(
+    rules: Sequence[Tuple[float, float, float]],
+) -> List[List[Tuple[float, float, float]]]:
+    """Group stacked rules into table candidates."""
+    clusters: List[List[Tuple[float, float, float]]] = []
+    for rule in rules:
+        if (
+            clusters
+            and rule[0] - clusters[-1][-1][0] <= 70.0
+            and min(rule[2], clusters[-1][-1][2]) - max(rule[1], clusters[-1][-1][1])
+            > 0.5 * min(rule[2] - rule[1], clusters[-1][-1][2] - clusters[-1][-1][1])
+        ):
+            clusters[-1].append(rule)
+        else:
+            clusters.append([rule])
+    return [
+        cluster
+        for cluster in clusters
+        if 3 <= len(cluster) <= 16
+        and (cluster[-1][0] - cluster[0][0]) >= 18.0
+    ]
+
+
+def _line_table_bboxes(page: object) -> List[BBox]:
+    """Return ruled table boxes that sparse horizontal clustering misses."""
+    try:
+        finder = page.find_tables(strategy="lines")
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        finder = None
+
+    page_area = max(1.0, float(page.rect.width) * float(page.rect.height))
+    page_width = max(1.0, float(page.rect.width))
+    verticals = _page_vertical_lines(page)
+    bboxes: List[BBox] = []
+    for table in (finder.tables if finder is not None else []):
+        if table.row_count < 2 or table.col_count < 2:
+            continue
+        left, top, right, bottom = (float(value) for value in table.bbox)
+        bottom_extensions = [
+            y1
+            for x, y0, y1 in verticals
+            if left - 2.0 <= x <= right + 2.0
+            and -1.0 <= y0 - bottom <= 1.0
+            and y1 > bottom + 2.0
+        ]
+        if len(bottom_extensions) >= 2:
+            bottom = max(bottom, max(bottom_extensions))
+        bbox = (left, top, right, bottom)
+        area = _bbox_area(bbox)
+        if area < 400.0 or area > page_area * 0.85:
+            continue
+        bboxes.append(bbox)
+
+    # Many academic tables intentionally omit vertical rules.  Pair a run of
+    # wide, aligned horizontal rules with its explicit caption instead of
+    # treating every chart grid as a table.
+    rules, _curves = _page_line_art(page)
+    wide_rules = [rule for rule in rules if rule[2] - rule[1] >= page_width * 0.4]
+    groups: List[List[Tuple[float, float, float]]] = []
+    for rule in wide_rules:
+        previous = groups[-1][-1] if groups else None
+        compatible = False
+        if previous is not None:
+            overlap = min(rule[2], previous[2]) - max(rule[1], previous[1])
+            compatible = (
+                rule[0] - previous[0] <= 180.0
+                and overlap >= 0.8 * min(
+                    rule[2] - rule[1],
+                    previous[2] - previous[1],
+                )
+            )
+        if compatible:
+            groups[-1].append(rule)
+        else:
+            groups.append([rule])
+
+    try:
+        page_blocks = _text_blocks(page)
+        captions = [
+            block
+            for block in page_blocks
+            if re.match(
+                r"^(?:Table|Tab\.|\u8868)\s*\d",
+                " ".join(block.text.split()),
+                re.IGNORECASE,
+            )
+        ]
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        page_blocks = []
+        captions = []
+    for top_rule, bottom_rule in zip(wide_rules, wide_rules[1:]):
+        top, left, top_right = top_rule
+        bottom, bottom_left, right = bottom_rule
+        if not 20.0 <= bottom - top <= 520.0:
+            continue
+        if abs(left - bottom_left) > 8.0 or abs(top_right - right) > 8.0:
+            continue
+        left = min(left, bottom_left)
+        right = max(top_right, right)
+        anchors = [
+            caption
+            for caption in captions
+            if caption.bbox[0] < right
+            and caption.bbox[2] > left
+            and (
+                -4.0 <= top - caption.bbox[3] <= 70.0
+                or -4.0 <= caption.bbox[1] - bottom <= 70.0
+            )
+        ]
+        cell_blocks = [
+            block
+            for block in page_blocks
+            if block not in captions
+            and left <= (block.bbox[0] + block.bbox[2]) / 2.0 <= right
+            and top <= (block.bbox[1] + block.bbox[3]) / 2.0 <= bottom
+        ]
+        if anchors and len(cell_blocks) >= 3:
+            bboxes.append((left, top, right, bottom))
+    for group in groups:
+        if len(group) < 3:
+            continue
+        left = min(rule[1] for rule in group)
+        top = group[0][0]
+        right = max(rule[2] for rule in group)
+        bottom = group[-1][0]
+        for caption in captions:
+            horizontal_overlap = min(right, caption.bbox[2]) - max(
+                left, caption.bbox[0]
+            )
+            if horizontal_overlap < 0.4 * min(
+                right - left,
+                caption.bbox[2] - caption.bbox[0],
+            ):
+                continue
+            above_gap = top - caption.bbox[3]
+            below_gap = caption.bbox[1] - bottom
+            if -4.0 <= above_gap <= 70.0:
+                bboxes.append((left, top, right, bottom))
+                break
+            if -4.0 <= below_gap <= 70.0:
+                bboxes.append((left, top, right, max(bottom, caption.bbox[1] - 2.0)))
+                break
+    return bboxes
+
+
+def _rule_is_text_underline(page: object, rule: Tuple[float, float, float]) -> bool:
+    """True when the rule underlines a source text span.
+
+    Underlines of replaced source text are legitimately erased together with
+    the text they decorate; only free-standing table rules must survive.
+    """
+    rule_y, rule_x0, rule_x1 = rule
+    try:
+        data = _page_text_dict(page)
+    except Exception:
+        return False
+    spans: List[Tuple[float, float]] = []
+    for block in data.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                bx0, _by0, bx1, by1 = span["bbox"]
+                # Underlines sit between the baseline and the glyph-box
+                # bottom (descender space), up to a couple of points below.
+                if not (by1 - 2.5 <= rule_y <= by1 + 2.8):
+                    continue
+                spans.append((bx0, bx1))
+
+    def underlines_span(x0: float, x1: float) -> bool:
+        width = max(1.0, x1 - x0)
+        for bx0, bx1 in spans:
+            # A table rule merely touching a caption extends past its text.
+            if x0 >= bx0 - 6.0 and x1 <= bx1 + 6.0:
+                overlap = min(x1, bx1) - max(x0, bx0)
+                if overlap >= 0.7 * width:
+                    return True
+        return False
+
+    if underlines_span(rule_x0, rule_x1):
+        return True
+
+    # Horizontal-rule extraction merges disjoint segments at the same y.
+    # Two separate hyperlinks can therefore become one apparent table rule.
+    # Require every actual segment to decorate text, including any continuous
+    # line beneath them; never exempt a real rule merely for spanning words.
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return False
+    segments: List[Tuple[float, float]] = []
+    for drawing in drawings:
+        if drawing.get("dashes") not in (None, "", "[] 0"):
+            continue
+        for item in drawing.get("items", []):
+            if item[0] == "l":
+                p0, p1 = item[1:3]
+                if abs(p0.y - p1.y) > 0.6:
+                    continue
+                y, x0, x1 = (p0.y + p1.y) / 2, min(p0.x, p1.x), max(p0.x, p1.x)
+            elif item[0] == "re":
+                rect = item[1]
+                if rect.height > 1.6:
+                    continue
+                y, x0, x1 = (rect.y0 + rect.y1) / 2, rect.x0, rect.x1
+            else:
+                continue
+            if abs(y - rule_y) <= 0.6 and x1 - x0 >= 40.0:
+                if x0 >= rule_x0 - 0.6 and x1 <= rule_x1 + 0.6:
+                    segments.append((x0, x1))
+    return bool(
+        len(segments) >= 2
+        and abs(min(x0 for x0, _ in segments) - rule_x0) <= 0.6
+        and abs(max(x1 for _, x1 in segments) - rule_x1) <= 0.6
+        and all(underlines_span(x0, x1) for x0, x1 in segments)
+    )
+
+
+def _rule_pixel_coverage(
+    page: object,
+    rule: Tuple[float, float, float],
+) -> float:
+    """Fraction of the rule's span showing ink at 216dpi."""
+    import fitz
+
+    rule_y, rule_x0, rule_x1 = rule
+    if rule_x1 - rule_x0 < 8.0:
+        return 1.0
+    scale = 3.0
+    clip = fitz.Rect(rule_x0 + 0.5, rule_y - 1.2, rule_x1 - 0.5, rule_y + 1.6)
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip)
+    except Exception:
+        return 1.0
+    if pix.width <= 0 or pix.height <= 0:
+        return 1.0
+    samples, stride, n = pix.samples, pix.stride, pix.n
+    dark_columns = 0
+    for xx in range(pix.width):
+        if any(samples[yy * stride + xx * n] < 130 for yy in range(pix.height)):
+            dark_columns += 1
+    return dark_columns / pix.width
+
+
+def _rule_inside_regions(
+    rule: Tuple[float, float, float],
+    regions: Sequence[BBox],
+) -> bool:
+    y, x0, x1 = rule
+    width = max(1.0, x1 - x0)
+    for rx0, ry0, rx1, ry1 in regions:
+        if not (ry0 - 2.0 <= y <= ry1 + 2.0):
+            continue
+        covered = min(x1, rx1 + 2.0) - max(x0, rx0 - 2.0)
+        if covered >= width * 0.7:
+            return True
+    return False
+
+
+def _figure_graphic_regions(
+    graphic_regions: Sequence[BBox],
+    caption_kinds: Sequence[Tuple[BBox, str]],
+) -> List[BBox]:
+    """Graphic envelopes paired with a nearby figure caption.
+
+    ``collect_graphic_regions`` also finds boxed tables, so passing every
+    envelope to table QA would hide genuine grid damage.  Figure art is
+    exempt only when a figure caption provides an independent semantic cue.
+    """
+    figures: List[BBox] = []
+    for region in graphic_regions:
+        rx0, ry0, rx1, ry1 = region
+        region_width = max(1.0, rx1 - rx0)
+        for (cx0, cy0, cx1, cy1), kind in caption_kinds:
+            if kind != "figure":
+                continue
+            caption_width = max(1.0, cx1 - cx0)
+            horizontal_overlap = min(rx1, cx1) - max(rx0, cx0)
+            if horizontal_overlap < 0.25 * min(region_width, caption_width):
+                continue
+            below_gap = cy0 - ry1
+            above_gap = ry0 - cy1
+            # Drawing envelopes often include axis labels or whitespace that
+            # reaches into the caption's extracted line box by a few points.
+            if -16.0 <= below_gap <= 180.0 or -16.0 <= above_gap <= 80.0:
+                figures.append(region)
+                break
+    return figures
+
+
+def _preserved_regions_above_figure_captions(
+    preserved_regions: Sequence[BBox],
+    caption_kinds: Sequence[Tuple[BBox, str]],
+) -> List[BBox]:
+    """Preserved figure parts above captions, excluding following body math."""
+    figures: List[BBox] = []
+    for region in preserved_regions:
+        rx0, _ry0, rx1, ry1 = region
+        region_width = max(1.0, rx1 - rx0)
+        for (cx0, cy0, cx1, _cy1), kind in caption_kinds:
+            if kind != "figure":
+                continue
+            caption_width = max(1.0, cx1 - cx0)
+            horizontal_overlap = min(rx1, cx1) - max(rx0, cx0)
+            if horizontal_overlap < 0.25 * min(region_width, caption_width):
+                continue
+            if -16.0 <= cy0 - ry1 <= 180.0:
+                figures.append(region)
+                break
+    return figures
+
+
+def _table_structure_issues(
+    page_number: int,
+    original_rules: Sequence[Tuple[float, float, float]],
+    original_curves: Sequence[float],
+    translated_rules: Sequence[Tuple[float, float, float]],
+    original_page: object = None,
+    translated_page: object = None,
+    preserved_regions: Sequence[BBox] = (),
+    graphic_regions: Sequence[BBox] = (),
+) -> List[object]:
+    """Compare table rule geometry between the original and the translation.
+
+    Tables are re-typeset cell by cell, so a header row set at the wrong
+    baseline shifts (or drops) its rules relative to the original grid.
+    Vector counting alone misses fill-overpainted rules (the rule object
+    survives redaction but background paint covers its middle), so each
+    cluster rule is also compared by rendered ink coverage.
+
+    Rules living inside preserved graphic regions (plot frames, legend
+    boxes) are restored verbatim and verified by the preserved-ink module;
+    counting them here only manufactures chart-shaped false tables.
+    """
+    excluded_regions = list(preserved_regions) + list(graphic_regions)
+    if excluded_regions:
+        original_rules = [
+            rule
+            for rule in original_rules
+            if not _rule_inside_regions(rule, excluded_regions)
+        ]
+        translated_rules = [
+            rule
+            for rule in translated_rules
+            if not _rule_inside_regions(rule, excluded_regions)
+        ]
+    original_clusters = _rule_clusters(original_rules)
+    if not original_clusters:
+        return []
+    rule_geometry_identical = bool(
+        len(original_rules) == len(translated_rules)
+        and all(
+            abs(original[0] - translated[0]) <= 0.2
+            and abs(original[1] - translated[1]) <= 0.5
+            and abs(original[2] - translated[2]) <= 0.5
+            for original, translated in zip(original_rules, translated_rules)
+        )
+    )
+    original_verticals = (
+        _page_vertical_lines(original_page) if original_page is not None else []
+    )
+    issues: List[object] = []
+    for cluster in original_clusters:
+        top, bottom = cluster[0][0], cluster[-1][0]
+        # Chart frames: narrow rules (subplot boxes) or bezier plot lines
+        # inside the band mean this is a figure, not a re-typeset table.
+        if max(rule[2] - rule[1] for rule in cluster) < 120.0:
+            continue
+        curves_in_band = sum(
+            1 for y in original_curves if top - 6.0 <= y <= bottom + 6.0
+        )
+        if curves_in_band >= 10:
+            continue
+        band_height = max(1.0, bottom - top)
+        cluster_x0 = min(rule[1] for rule in cluster)
+        cluster_x1 = max(rule[2] for rule in cluster)
+        frame_verticals = sum(
+            1
+            for x, y0, y1 in original_verticals
+            if cluster_x0 - 4.0 <= x <= cluster_x1 + 4.0
+            and min(bottom, y1) - max(top, y0) >= band_height * 0.55
+        )
+        if frame_verticals >= 2:
+            # Plot frames and legend boxes: vertical edges spanning the rule
+            # band mean boxed chart art, not an academic table.
+            continue
+        # Match per source rule, mirroring the cluster criterion: a short
+        # in-table rule (equation underline glued into the cluster) must not
+        # be dropped for covering little of the whole cluster envelope,
+        # otherwise the original never matches its own geometry.
+        counterpart = (
+            list(cluster)
+            if rule_geometry_identical
+            else [
+                rule
+                for rule in translated_rules
+                if top - 12.0 <= rule[0] <= bottom + 12.0
+                and any(
+                    min(rule[2], source[2]) - max(rule[1], source[1])
+                    > 0.5 * min(rule[2] - rule[1], source[2] - source[1])
+                    for source in cluster
+                )
+            ]
+        )
+        if not counterpart:
+            issues.append(
+                _issue(
+                    page_number,
+                    "table_structure_mismatch",
+                    (
+                        f"Page {page_number}: table grid at y={top:.0f}-{bottom:.0f} "
+                        f"lost its rules in the translation"
+                    ),
+                )
+            )
+            continue
+        offsets = sorted(rule[0] - top for rule in cluster)
+        translated_top = counterpart[0][0]
+        translated_offsets = sorted(rule[0] - translated_top for rule in counterpart)
+        if len(offsets) != len(translated_offsets):
+            issues.append(
+                _issue(
+                    page_number,
+                    "table_structure_mismatch",
+                    (
+                        f"Page {page_number}: table at y={top:.0f} has "
+                        f"{len(translated_offsets)} rules vs {len(offsets)} in the "
+                        f"original"
+                    ),
+                )
+            )
+            continue
+        drift = max(
+            abs(original_offset - translated_offset)
+            for original_offset, translated_offset in zip(offsets, translated_offsets)
+        )
+        if drift > 2.5:
+            issues.append(
+                _issue(
+                    page_number,
+                    "table_structure_mismatch",
+                    (
+                        f"Page {page_number}: table at y={top:.0f} rules drifted "
+                        f"up to {drift:.1f}pt from the original grid"
+                    ),
+                )
+            )
+            if len(issues) >= 3:
+                break
+            continue
+        if original_page is not None and translated_page is not None:
+            for rule in cluster:
+                source_coverage = _rule_pixel_coverage(original_page, rule)
+                if source_coverage < 0.85:
+                    continue
+                translated_coverage = _rule_pixel_coverage(translated_page, rule)
+                if source_coverage - translated_coverage > 0.25 and not (
+                    _rule_is_text_underline(original_page, rule)
+                ):
+                    issues.append(
+                        _issue(
+                            page_number,
+                            "table_structure_mismatch",
+                            (
+                                f"Page {page_number}: table rule at y={rule[0]:.1f} "
+                                f"is partially erased in the translation "
+                                f"(ink coverage {source_coverage:.2f} -> "
+                                f"{translated_coverage:.2f})"
+                            ),
+                        )
+                    )
+                    break
+        if len(issues) >= 3:
+            break
+    return issues
+
+
+def _band_cell_rows(page: object, band: BBox) -> List[List[BBox]]:
+    """Text rows inside a rule band, each row split into cells by x gaps."""
+    x0, y0, x1, y1 = band
+    lines: List[Tuple[BBox, float]] = []
+    try:
+        raw = _page_text_dict(page)
+    except Exception:
+        return []
+    for block in raw.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            bbox = tuple(float(value) for value in line.get("bbox", (0, 0, 0, 0)))
+            text = "".join(span.get("text", "") for span in line.get("spans", []))
+            if not text.strip():
+                continue
+            center_x = (bbox[0] + bbox[2]) / 2.0
+            center_y = (bbox[1] + bbox[3]) / 2.0
+            if not (x0 <= center_x <= x1 and y0 <= center_y <= y1):
+                continue
+            size = max(
+                (float(span.get("size", 0.0)) for span in line.get("spans", [])),
+                default=0.0,
+            )
+            lines.append((bbox, size))
+    rows: List[List[Tuple[BBox, float]]] = []
+    for line in sorted(lines, key=lambda item: ((item[0][1] + item[0][3]) / 2.0, item[0][0])):
+        bbox = line[0]
+        for row in rows:
+            other = row[0][0]
+            overlap = min(bbox[3], other[3]) - max(bbox[1], other[1])
+            if overlap >= 0.5 * min(bbox[3] - bbox[1], other[3] - other[1]):
+                row.append(line)
+                break
+        else:
+            rows.append([line])
+    cell_rows: List[List[BBox]] = []
+    for row in rows:
+        cells: List[BBox] = []
+        for bbox, size in sorted(row, key=lambda item: item[0][0]):
+            gap_limit = max(3.0, 0.5 * size)
+            if cells and bbox[0] - cells[-1][2] <= gap_limit:
+                previous = cells[-1]
+                cells[-1] = (
+                    previous[0],
+                    min(previous[1], bbox[1]),
+                    max(previous[2], bbox[2]),
+                    max(previous[3], bbox[3]),
+                )
+            else:
+                cells.append(bbox)
+        cell_rows.append(cells)
+    return cell_rows
+
+
+def _second_column_spread(rows: Sequence[Sequence[BBox]]) -> Optional[float]:
+    """Spread of the second cell's left edge across multi-cell rows."""
+    lefts = [row[1][0] for row in rows if len(row) >= 2]
+    if len(lefts) < 2:
+        return None
+    return max(lefts) - min(lefts)
+
+
+def _compact_table_bands(
+    rules: Sequence[Tuple[float, float, float]],
+    verticals: Sequence[Tuple[float, float, float]],
+    excluded_regions: Sequence[BBox],
+) -> List[BBox]:
+    """Booktabs-style rule stacks, including narrow side tables.
+
+    Two or more aligned rules at least 60pt wide and 12pt apart bound a table
+    body; frames with two vertical edges are boxes, not tables, and rules
+    inside figures belong to charts.
+    """
+    clusters: List[List[Tuple[float, float, float]]] = []
+    for rule in sorted(rules):
+        if rule[2] - rule[1] < 60.0:
+            continue
+        if (
+            clusters
+            and rule[0] - clusters[-1][-1][0] <= 70.0
+            and abs(rule[1] - clusters[-1][-1][1]) <= 6.0
+            and abs(rule[2] - clusters[-1][-1][2]) <= 6.0
+        ):
+            clusters[-1].append(rule)
+        else:
+            clusters.append([rule])
+    bands: List[BBox] = []
+    for cluster in clusters:
+        if len(cluster) < 2:
+            continue
+        top, bottom = cluster[0][0], cluster[-1][0]
+        if bottom - top < 12.0:
+            continue
+        left = min(rule[1] for rule in cluster)
+        right = max(rule[2] for rule in cluster)
+        if any(_rule_inside_regions(rule, excluded_regions) for rule in cluster):
+            continue
+        frame_edges = sum(
+            1
+            for x, y0, y1 in verticals
+            if left - 4.0 <= x <= right + 4.0
+            and min(bottom, y1) - max(top, y0) >= (bottom - top) * 0.55
+        )
+        if frame_edges >= 2:
+            continue
+        bands.append((left, top, right, bottom))
+    return bands
+
+
+def _table_cell_layout_issues(
+    page_number: int,
+    original_page: object,
+    translated_page: object,
+    original_rules: Sequence[Tuple[float, float, float]],
+    *,
+    excluded_regions: Sequence[BBox] = (),
+) -> List[object]:
+    """Detect table cells that the translation re-flowed into prose lines.
+
+    Rule geometry survives when a small borderless table is mistaken for a
+    paragraph: the rules are vector art and stay put while the cell text is
+    re-set as running lines. Compare the text grid inside every rule band:
+    the source rows carry several cells each, a re-flowed translation carries
+    one wide line per row (or spills past the rules).
+    """
+    verticals = _page_vertical_lines(original_page)
+    issues: List[object] = []
+    for band in _compact_table_bands(original_rules, verticals, excluded_regions):
+        left, top, right, bottom = band
+        probe = (left - 4.0, top - 1.0, right + 4.0, bottom + 1.0)
+        source_rows = [row for row in _band_cell_rows(original_page, probe) if row]
+        if len(source_rows) < 2:
+            continue
+        source_max_cells = max(len(row) for row in source_rows)
+        source_multi = sum(1 for row in source_rows if len(row) >= 2)
+        if source_max_cells < 2 or source_multi < 2:
+            continue
+        translated_rows = [row for row in _band_cell_rows(translated_page, probe) if row]
+        if not translated_rows:
+            continue
+        translated_max_cells = max(len(row) for row in translated_rows)
+        translated_multi = sum(1 for row in translated_rows if len(row) >= 2)
+        band_width = max(1.0, right - left)
+        source_wide = any(
+            (cell[2] - cell[0]) >= 0.85 * band_width for row in source_rows for cell in row
+        )
+        translated_wide = any(
+            (cell[2] - cell[0]) >= 0.85 * band_width
+            for row in translated_rows
+            for cell in row
+        )
+        source_spill = max(
+            (max(cell[2] - right, left - cell[0]) for row in source_rows for cell in row),
+            default=0.0,
+        )
+        spill = max(
+            (
+                max(cell[2] - right, left - cell[0]) - max(0.0, source_spill)
+                for row in translated_rows
+                for cell in row
+            ),
+            default=0.0,
+        )
+        # Justified prose inside the band splits into pseudo-cells at its
+        # word gaps, but those never line up across rows the way a real
+        # second column does.
+        source_spread = _second_column_spread(source_rows)
+        translated_spread = _second_column_spread(translated_rows)
+        misaligned = (
+            source_spread is not None
+            and translated_spread is not None
+            and source_spread <= 3.0
+            and translated_spread > 8.0
+        )
+        collapsed = (
+            translated_max_cells < source_max_cells
+            or translated_multi < source_multi - 1
+            or (translated_wide and not source_wide)
+            or misaligned
+        )
+        if collapsed:
+            issues.append(
+                _issue(
+                    page_number,
+                    "table_cells_reflowed",
+                    (
+                        f"Page {page_number}: table at y={top:.0f}-{bottom:.0f} has "
+                        f"{source_multi} source rows with up to {source_max_cells} cells, "
+                        f"but the translation sets them as {translated_multi} multi-cell "
+                        f"rows (up to {translated_max_cells} cells): cells re-flowed as prose"
+                    ),
+                )
+            )
+        elif spill > 2.0:
+            issues.append(
+                _issue(
+                    page_number,
+                    "table_cells_reflowed",
+                    (
+                        f"Page {page_number}: table at y={top:.0f}-{bottom:.0f}: translated "
+                        f"cell text runs {spill:.1f}pt past the table rules"
+                    ),
+                )
+            )
+        if len(issues) >= 3:
+            break
+    return issues
+
+
+def _text_frames(
+    page: object,
+    excluded_regions: Sequence[BBox],
+) -> List[BBox]:
+    """Boxes drawn around source text: paired vertical edges with text inside."""
+    verticals = _page_vertical_lines(page)
+    page_width = float(page.rect.width)
+    page_height = float(page.rect.height)
+    frames: List[BBox] = []
+    for index, (ax, ay0, ay1) in enumerate(verticals):
+        for bx, by0, by1 in verticals[index + 1 :]:
+            width = abs(bx - ax)
+            if width < 40.0 or width > page_width * 0.95:
+                continue
+            overlap = min(ay1, by1) - max(ay0, by0)
+            height = min(ay1 - ay0, by1 - by0)
+            if height <= 0 or overlap < 0.8 * height:
+                continue
+            frame = (min(ax, bx), max(ay0, by0), max(ax, bx), min(ay1, by1))
+            if frame[3] - frame[1] > page_height * 0.6:
+                continue
+            # A text box lies on the page; plot frames and clip boxes of
+            # figures routinely run off it.
+            if frame[0] < -2.0 or frame[2] > page_width + 2.0:
+                continue
+            frames.append(frame)
+    if not frames:
+        return []
+    inner_art = _inner_graphic_bboxes(page)
+    kept: List[BBox] = []
+    for frame in frames:
+        center = ((frame[0] + frame[2]) / 2.0, (frame[1] + frame[3]) / 2.0)
+        if any(
+            region[0] <= center[0] <= region[2] and region[1] <= center[1] <= region[3]
+            for region in excluded_regions
+        ):
+            continue
+        if any(
+            abs(frame[0] - other[0]) <= 2.0
+            and abs(frame[2] - other[2]) <= 2.0
+            and abs(frame[1] - other[1]) <= 2.0
+            and abs(frame[3] - other[3]) <= 2.0
+            for other in kept
+        ):
+            continue
+        # Chart frames are full of curves, bars and images; a text box holds
+        # nothing but its own edges.
+        art_inside = sum(
+            1
+            for art in inner_art
+            if art[0] >= frame[0] - 1.0
+            and art[2] <= frame[2] + 1.0
+            and art[1] >= frame[1] - 1.0
+            and art[3] <= frame[3] + 1.0
+            and (art[2] - art[0] > 3.0 or art[3] - art[1] > 3.0)
+        )
+        if art_inside >= 1:
+            continue
+        cells = _band_cell_rows(page, frame)
+        if not cells:
+            continue
+        text_area = sum(
+            max(0.0, cell[2] - cell[0]) * max(0.0, cell[3] - cell[1])
+            for row in cells
+            for cell in row
+        )
+        frame_area = max(
+            1.0,
+            (frame[2] - frame[0]) * (frame[3] - frame[1]),
+        )
+        if text_area / frame_area < 0.10:
+            # Plot frames, legend swatches and empty panels only carry a few
+            # tick labels; a box meant to hold refilled prose fills far more
+            # of its area. Without this a float caption crossing a chart
+            # frame is reported as text escaping a text box.
+            continue
+        kept.append(frame)
+    return kept
+
+
+def _inner_graphic_bboxes(page: object) -> List[BBox]:
+    """Bboxes of drawings that are not hairline rules, plus placed images."""
+    boxes: List[BBox] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        drawings = []
+    for drawing in drawings:
+        rect = drawing.get("rect")
+        if rect is None:
+            continue
+        width, height = float(rect.width), float(rect.height)
+        if width <= 1.6 or height <= 1.6:
+            continue
+        has_curve = any(item and item[0] == "c" for item in drawing.get("items", ()))
+        if has_curve or drawing.get("fill") is not None:
+            boxes.append((float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)))
+    try:
+        for image in page.get_images():
+            rect = page.get_image_bbox(image)
+            if rect and rect.is_valid and not rect.is_empty:
+                boxes.append((float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)))
+    except Exception:
+        pass
+    return boxes
+
+
+_CAPTION_LABEL_RE = re.compile(r"^(?:Figure|Fig\.?|Table|图|表)\s*\d", re.IGNORECASE)
+
+
+def _looks_like_caption_block(block: dict) -> bool:
+    """True when a translated block starts with a figure/table caption label."""
+    for line in block.get("lines", []):
+        text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
+        if text:
+            return bool(_CAPTION_LABEL_RE.match(text))
+    return False
+
+
+def _frame_overflow_issues(
+    page_number: int,
+    original_page: object,
+    translated_page: object,
+    *,
+    excluded_regions: Sequence[BBox] = (),
+) -> List[object]:
+    """Detect translated text that runs outside the box drawn around it.
+
+    Boxed prompts and framed notes keep their vector frame through
+    redaction; only the refilled text can escape it, either sideways when the
+    block was widened past the frame or downward when it grew across the
+    bottom rule.
+    """
+    issues: List[object] = []
+    for frame in _text_frames(original_page, excluded_regions):
+        fx0, fy0, fx1, fy1 = frame
+        # Small rectangles around figure legends/tables are graphic panels: a
+        # caption line laid out below the figure legitimately crosses them.
+        legend_panel = (fx1 - fx0) < 160.0 and (fy1 - fy0) < 120.0
+        try:
+            raw = _page_text_dict(translated_page)
+        except Exception:
+            return issues
+        # The source text is the reference for how tightly text may sit
+        # against this frame: glyph boxes routinely poke a descender's worth
+        # past a rule, and only excess beyond the source counts.
+        source_cells = [cell for row in _band_cell_rows(original_page, frame) for cell in row]
+        if not source_cells:
+            # A graphic panel frame with no source text inside is a figure
+            # element, not a text box: translated captions cannot "overflow" it.
+            continue
+        # A caption block may be laid out below/around a short legend panel:
+        # its lines legitimately cross the panel frame, so they are not text
+        # that "overflowed" the box.
+        caption_regions = [
+            tuple(float(value) for value in block.get("bbox", (0, 0, 0, 0)))
+            for block in raw.get("blocks", [])
+            if block.get("type") == 0 and _looks_like_caption_block(block)
+        ]
+        source_excess = {
+            "right": max((cell[2] - fx1 for cell in source_cells), default=0.0),
+            "left": max((fx0 - cell[0] for cell in source_cells), default=0.0),
+            "bottom": max((cell[3] - fy1 for cell in source_cells), default=0.0),
+        }
+        worst: Optional[Tuple[float, str, str]] = None
+        for block in raw.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                bbox = tuple(float(value) for value in line.get("bbox", (0, 0, 0, 0)))
+                text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
+                if not text:
+                    continue
+                if legend_panel and (bbox[2] - bbox[0]) >= (fx1 - fx0) * 0.95:
+                    continue
+                center_x = (bbox[0] + bbox[2]) / 2.0
+                center_y = (bbox[1] + bbox[3]) / 2.0
+                if any(
+                    region[0] - 2.0 <= center_x <= region[2] + 2.0
+                    and region[1] - 2.0 <= center_y <= region[3] + 2.0
+                    for region in caption_regions
+                ):
+                    continue
+                # Preserved source labels (figure box text such as "Gate" or
+                # "PhoneLM-0.5B") are not refilled Chinese; their source
+                # geometry is the reference and they must not be reported as
+                # translated overflow.
+                if not _CJK_RE.search(text):
+                    continue
+                center_y = (bbox[1] + bbox[3]) / 2.0
+                if not (fy0 - 1.0 <= center_y <= fy1 + 1.0):
+                    continue
+                horizontal_overlap = min(bbox[2], fx1) - max(bbox[0], fx0)
+                if horizontal_overlap < 0.5 * max(1.0, bbox[2] - bbox[0]):
+                    continue
+                overflow_right = bbox[2] - fx1 - max(0.0, source_excess["right"])
+                overflow_left = fx0 - bbox[0] - max(0.0, source_excess["left"])
+                overflow_bottom = (
+                    bbox[3]
+                    - fy1
+                    - max(1.5, 0.32 * (bbox[3] - bbox[1]))
+                    - max(0.0, source_excess["bottom"])
+                )
+                candidates = (
+                    (overflow_right, "right"),
+                    (overflow_left, "left"),
+                    (overflow_bottom, "bottom"),
+                )
+                amount, side = max(candidates, key=lambda item: item[0])
+                if amount > 1.5 and (worst is None or amount > worst[0]):
+                    worst = (amount, side, text[:40])
+        if worst is not None:
+            amount, side, snippet = worst
+            issues.append(
+                _issue(
+                    page_number,
+                    "text_outside_frame",
+                    (
+                        f"Page {page_number}: text in the box at x={fx0:.0f}-{fx1:.0f}, "
+                        f"y={fy0:.0f}-{fy1:.0f} runs {amount:.1f}pt past its {side} edge: "
+                        f"{snippet!r}"
+                    ),
+                )
+            )
+        if len(issues) >= 3:
+            break
+    return issues
+
+
+def _display_alignment_issues(
+    original_ink: _InkCache,
+    translated_ink: _InkCache,
+    page_number: int,
+    equation_rows: Sequence[BBox],
+    *,
+    algorithm_regions: Sequence[BBox] = (),
+    table_regions: Sequence[BBox] = (),
+    source_role_blocks: Sequence[object] = (),
+) -> List[object]:
+    issues: List[object] = []
+    page_width = float(original_ink._page.rect.width)
+    first_page_author_rows: List[BBox] = []
+    if page_number == 1:
+        from .pdf_layout import (
+            _looks_like_author_or_affiliation_text,
+            strip_sentinels,
+        )
+
+        for block in source_role_blocks:
+            block_bbox = getattr(block, "bbox", None)
+            block_text = getattr(block, "text", "")
+            if block_bbox is None or not block_text:
+                continue
+            plain = " ".join(strip_sentinels(block_text).split())
+            if _looks_like_author_or_affiliation_text(plain):
+                first_page_author_rows.append(tuple(block_bbox))
+    for row in equation_rows:
+        row_area = _bbox_area(row)
+        if row_area < 400.0:
+            continue
+        if any(
+            _bbox_overlap_area(row, author_row) >= row_area * 0.80
+            for author_row in first_page_author_rows
+        ):
+            continue
+        if any(
+            _bbox_overlap_area(row, region) >= row_area * 0.80
+            for region in algorithm_regions
+        ):
+            continue
+        if any(
+            _bbox_overlap_area(row, region) >= row_area * 0.80
+            for region in table_regions
+        ):
+            continue
+        if any(
+            (
+                getattr(block, "formula_anchors", ())
+                and any(
+                    _bbox_overlap_area(row, anchor) > 0.0
+                    for anchor in getattr(block, "formula_anchors", ())
+                )
+            )
+            or (
+                getattr(block, "flow_inline_math", False)
+                and any(
+                    _bbox_overlap_area(row, anchor) > 0.0
+                    for anchor in getattr(block, "formula_anchors", ())
+                )
+            )
+            or (
+                getattr(block, "flow_inline_math", False)
+                and any(
+                    _bbox_overlap_area(row, atom) > 0.0
+                    for group in getattr(
+                        block,
+                        "keepout_formula_atom_groups",
+                        (),
+                    )
+                    for atom in group
+                )
+            )
+            or (
+                getattr(block, "block_type", "") == "formula_prose"
+                and getattr(block, "flow_inline_math", False)
+                and getattr(block, "preserve_position", False)
+                and not getattr(block, "formula_anchors", ())
+                and any(
+                    _bbox_overlap_area(row, atom) > 0.0
+                    for group in getattr(
+                        block,
+                        "redaction_formula_restore_groups",
+                        (),
+                    )
+                    for atom in group
+                )
+            )
+            for block in source_role_blocks
+        ):
+            continue
+        # TeX math rows report metric boxes that reach into the next prose
+        # line. Trim the vertical edges so its punctuation/ascenders cannot
+        # skew the horizontal ink centroid (a false misalignment).
+        row_height = max(0.0, row[3] - row[1])
+        inset = row_height * 0.25
+        exact_window = (
+            max(0.0, row[0]),
+            max(0.0, row[1] + inset),
+            min(page_width, row[2]),
+            row[3] - inset,
+        )
+        if exact_window[3] <= exact_window[1]:
+            exact_window = (
+                max(0.0, row[0]),
+                max(0.0, row[1] - 1.0),
+                min(page_width, row[2]),
+                row[3] + 1.0,
+            )
+        source_profile = original_ink.get().centroid_x(exact_window)
+        translated_profile = translated_ink.get().centroid_x(exact_window)
+        exact_drift = (
+            abs(source_profile - translated_profile)
+            if source_profile is not None and translated_profile is not None
+            else None
+        )
+        if exact_drift is not None and exact_drift <= 3.0:
+            continue
+        observation_window = (
+            max(0.0, row[0] - _DISPLAY_ALIGN_WINDOW_PAD_PT),
+            row[1],
+            min(page_width, row[2] + _DISPLAY_ALIGN_WINDOW_PAD_PT),
+            row[3],
+        )
+        wide_source = original_ink.get().centroid_x(observation_window)
+        wide_translated = translated_ink.get().centroid_x(observation_window)
+        wide_drift = (
+            abs(wide_source - wide_translated)
+            if wide_source is not None and wide_translated is not None
+            else None
+        )
+        if wide_drift is None and exact_drift is None:
+            continue
+        drift = wide_drift if wide_drift is not None else exact_drift
+        if drift <= _DISPLAY_ALIGN_TOLERANCE_PT:
+            continue
+        issues.append(
+            _issue(
+                page_number,
+                "display_formula_misaligned",
+                (
+                    f"Page {page_number}: displayed equation at y={row[1]:.0f} "
+                    f"shifted horizontally by {drift:.0f}pt vs original"
+                ),
+                severity="warning",
+            )
+        )
+        if len(issues) >= 3:
+            break
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# references
+# ---------------------------------------------------------------------------
+
+
+def _reference_region_bboxes(
+    page: object,
+    reference_y: Optional[float],
+) -> List[BBox]:
+    """Map a bibliography start through the page's column reading order."""
+    if reference_y is None:
+        return []
+    width = float(page.rect.width)
+    height = float(page.rect.height)
+    if reference_y <= 0.0:
+        return [(0.0, 0.0, width, height)]
+
+    heading_bbox: Optional[BBox] = None
+    for block in _text_blocks(page):
+        compact = " ".join(block.text.split()).rstrip(":：")
+        if re.match(r"^(?:references|bibliography|参考文献)$", compact, re.IGNORECASE):
+            heading_bbox = block.bbox
+            break
+    if heading_bbox is None:
+        return [(0.0, reference_y - 4.0, width, height)]
+
+    midpoint = width / 2.0
+    narrow_heading = heading_bbox[2] - heading_bbox[0] < width * 0.45
+    gutter_tolerance = width * 0.02
+    heading_in_left_column = (
+        heading_bbox[0] < midpoint - gutter_tolerance
+        and heading_bbox[2] <= midpoint + gutter_tolerance
+    )
+    heading_in_right_column = (
+        heading_bbox[0] >= midpoint - gutter_tolerance
+        and heading_bbox[2] > midpoint + gutter_tolerance
+    )
+    # A short heading also sits in the left half of a single-column page.
+    # Require source text lines in both columns before treating the opposite
+    # column above that heading as bibliography.  Use line boxes so PDF text
+    # blocks that merge the two reading columns still expose their geometry.
+    source_columns: Dict[str, List[BBox]] = {"left": [], "right": []}
+    for raw_block in _page_text_dict(page).get("blocks", []):
+        if raw_block.get("type") != 0:
+            continue
+        for line in raw_block.get("lines", []):
+            bbox = line.get("bbox")
+            text = " ".join(span.get("text", "") for span in line.get("spans", []))
+            if (
+                bbox is None
+                or len(text.strip()) < 20
+                or bbox[1] < height * 0.05
+                or bbox[3] > height * 0.95
+            ):
+                continue
+            if (
+                bbox[0] < midpoint - gutter_tolerance
+                and bbox[2] <= midpoint + gutter_tolerance
+            ):
+                source_columns["left"].append(tuple(bbox))
+            elif (
+                bbox[0] >= midpoint - gutter_tolerance
+                and bbox[2] > midpoint + gutter_tolerance
+            ):
+                source_columns["right"].append(tuple(bbox))
+    # Isolated running titles and short citation tails can occupy opposite
+    # halves of a single text column. Require multiple shared reading rows;
+    # repeated fragments on the same physical row count only once.
+    paired_rows: Dict[str, set[float]] = {"left": set(), "right": set()}
+    for left in source_columns["left"]:
+        for right in source_columns["right"]:
+            if min(left[3], right[3]) <= max(left[1], right[1]):
+                continue
+            paired_rows["left"].add(round((left[1] + left[3]) / 2.0, 1))
+            paired_rows["right"].add(round((right[1] + right[3]) / 2.0, 1))
+    if any(len(rows) < 2 for rows in paired_rows.values()):
+        return [(0.0, reference_y - 4.0, width, height)]
+    if narrow_heading and heading_in_left_column:
+        return [
+            (0.0, reference_y - 4.0, midpoint, height),
+            (midpoint, 0.0, width, height),
+        ]
+    if narrow_heading and heading_in_right_column:
+        return [(midpoint, reference_y - 4.0, width, height)]
+    return [(0.0, reference_y - 4.0, width, height)]
+
+
+def _reference_continuation_regions(
+    page: object,
+    source_role_blocks: Sequence[object],
+) -> List[BBox]:
+    """Keep a carried bibliography active only until each column's section.
+
+    A two-column page can finish references in the upper left while the right
+    column has already entered an appendix.  Treating a heading near the top
+    as a page-wide boundary flags the last bibliography entries; treating the
+    whole page as references hides untranslated appendix prose.  Bibliography
+    markers before the first heading in each reading column provide the local
+    boundary without guessing from translated text.
+    """
+    width = float(page.rect.width)
+    height = float(page.rect.height)
+    headings = [
+        tuple(float(value) for value in getattr(block, "bbox"))
+        for block in source_role_blocks
+        if getattr(block, "block_type", "") in {"title", "heading"}
+        and bool(getattr(block, "should_translate", True))
+        and getattr(block, "bbox", None) is not None
+    ]
+    if not headings:
+        return [(0.0, 0.0, width, height)]
+
+    prose_widths = [
+        float(getattr(block, "bbox")[2]) - float(getattr(block, "bbox")[0])
+        for block in source_role_blocks
+        if getattr(block, "block_type", "") not in {"title", "heading"}
+        and getattr(block, "bbox", None) is not None
+    ]
+    if any(block_width >= width * 0.55 for block_width in prose_widths):
+        columns = [(0.0, width, min(bbox[1] for bbox in headings))]
+    else:
+        midpoint = width / 2.0
+        columns = []
+        for left, right in ((0.0, midpoint), (midpoint, width)):
+            column_headings = [
+                bbox
+                for bbox in headings
+                if left <= (bbox[0] + bbox[2]) / 2.0 < right
+            ]
+            stop = min((bbox[1] for bbox in column_headings), default=height)
+            columns.append((left, right, stop))
+
+    page_blocks = _text_blocks(page)
+    regions: List[BBox] = []
+    for left, right, stop in columns:
+        fragments = [
+            block.text
+            for block in page_blocks
+            if left <= (block.bbox[0] + block.bbox[2]) / 2.0 < right
+            and block.bbox[1] < stop - 4.0
+            and block.bbox[3] > height * 0.06
+        ]
+        if len(_BIBLIOGRAPHY_MARKER_RE.findall(" ".join(fragments))) < 2:
+            continue
+        regions.append((left, 0.0, right, max(0.0, stop - 4.0)))
+    return regions
+
+
+def _reference_issues(
+    original_page: object,
+    translated_page: object,
+    page_number: int,
+    reference_y: Optional[float],
+    *,
+    source_role_blocks: Sequence[object] = (),
+    reference_regions: Optional[Sequence[BBox]] = None,
+) -> List[object]:
+    if reference_y is None:
+        return []
+    issues: List[object] = []
+
+    # Bibliography geometry deliberately follows column reading order, so on
+    # mixed pages its coarse rectangles can also contain legitimate body,
+    # appendix, caption, or repeated-header translations.  Exclude only source
+    # blocks that structure analysis positively selected for translation and
+    # that do not themselves resemble reference entries.  A misclassified
+    # bibliography entry therefore remains visible to this guard.
+    from .pdf_layout import _looks_like_reference_entry_text, strip_sentinels
+
+    translation_exclusions: List[BBox] = []
+    page_width = float(original_page.rect.width)
+    for source_block in source_role_blocks:
+        source_text = " ".join(
+            strip_sentinels(str(getattr(source_block, "text", ""))).split()
+        )
+        bbox = getattr(source_block, "bbox", None)
+        if bbox is None:
+            continue
+        source_bbox = tuple(float(value) for value in bbox)
+        # A running header such as "Published as a conference paper at ICLR
+        # 2021" carries a venue and a year and passes for a bibliography
+        # entry; by role it never is one, and on continuation pages the
+        # reference region starts at y=0 and would otherwise swallow it.
+        if getattr(source_block, "block_type", "") in {"header", "footer"}:
+            translation_exclusions.append(source_bbox)
+            continue
+        full_width_before_heading = bool(
+            reference_y > 0.0
+            and source_bbox[1] < reference_y - 4.0
+            and source_bbox[2] - source_bbox[0] >= page_width * 0.55
+        )
+        if (
+            _looks_like_reference_entry_text(source_text)
+            and not full_width_before_heading
+        ):
+            continue
+        translation_exclusions.append(source_bbox)
+
+    def reference_spans(page: object) -> List[_Span]:
+        selected_regions = (
+            list(reference_regions)
+            if reference_regions is not None
+            else _reference_region_bboxes(page, reference_y)
+        )
+        page_spans: List[_Span] = []
+        for page_block in _text_blocks(page):
+            center_x = (page_block.bbox[0] + page_block.bbox[2]) / 2.0
+            center_y = (page_block.bbox[1] + page_block.bbox[3]) / 2.0
+            if not any(
+                left <= center_x <= right and top <= center_y <= bottom
+                for left, top, right, bottom in selected_regions
+            ):
+                continue
+            for span in page_block.spans:
+                if not span.visible or not span.text.strip():
+                    continue
+                span_area = max(1.0, _bbox_area(span.bbox))
+                if any(
+                    _bbox_overlap_area(span.bbox, excluded) >= 0.20 * span_area
+                    for excluded in translation_exclusions
+                ):
+                    continue
+                page_spans.append(span)
+        return page_spans[:400]
+
+    original_spans = reference_spans(original_page)
+    spans: List[_Span] = []
+    spans.extend(reference_spans(translated_page))
+
+    source_reference_text = " ".join(span.text.strip() for span in original_spans)
+    translated_reference_text = " ".join(span.text.strip() for span in spans)
+    source_latin_words = _LATIN_WORD_RE.findall(source_reference_text)
+    source_cjk = len(_CJK_HAN_RE.findall(source_reference_text))
+    translated_cjk = len(_CJK_HAN_RE.findall(translated_reference_text))
+    introduced_cjk = max(0, translated_cjk - source_cjk)
+    if len(source_latin_words) >= 20 and introduced_cjk >= 12:
+        issues.append(
+            _issue(
+                page_number,
+                "reference_content_changed",
+                (
+                    f"Page {page_number}: protected references gained "
+                    f"{introduced_cjk} translated CJK characters"
+                ),
+                # A translated reference entry is a style deviation, not a
+                # layout defect; reference_overlap still blocks real collisions.
+                severity="warning",
+            )
+        )
+
+    def same_source_span(candidate: _Span, source: _Span) -> bool:
+        if candidate.text.strip() != source.text.strip():
+            return False
+        return all(
+            abs(float(candidate.bbox[index]) - float(source.bbox[index])) <= 2.0
+            for index in range(4)
+        )
+
+    def source_has_same_overlap(first: _Span, second: _Span) -> bool:
+        for source_index, source_first in enumerate(original_spans):
+            for source_second in original_spans[source_index + 1 :]:
+                same_order = same_source_span(first, source_first) and same_source_span(
+                    second, source_second
+                )
+                reverse_order = same_source_span(first, source_second) and same_source_span(
+                    second, source_first
+                )
+                if not (same_order or reverse_order):
+                    continue
+                source_width = min(source_first.bbox[2], source_second.bbox[2]) - max(
+                    source_first.bbox[0], source_second.bbox[0]
+                )
+                source_height = min(source_first.bbox[3], source_second.bbox[3]) - max(
+                    source_first.bbox[1], source_second.bbox[1]
+                )
+                if source_width > 5.0 and source_height > 4.5:
+                    return True
+        return False
+
+    overlap_reported = 0
+    for i in range(len(spans)):
+        for j in range(i + 1, len(spans)):
+            first, second = spans[i], spans[j]
+            width = min(first.bbox[2], second.bbox[2]) - max(
+                first.bbox[0], second.bbox[0]
+            )
+            height = min(first.bbox[3], second.bbox[3]) - max(
+                first.bbox[1], second.bbox[1]
+            )
+            if width <= 5.0 or height <= 4.5:
+                continue
+            if first.text.strip() == second.text.strip():
+                continue
+            if len(first.text.strip()) < 4 or len(second.text.strip()) < 4:
+                continue
+            if source_has_same_overlap(first, second):
+                continue
+            issues.append(
+                _issue(
+                    page_number,
+                    "reference_overlap",
+                    (
+                        f"Page {page_number}: references text overlap at "
+                        f"x={max(first.bbox[0], second.bbox[0]):.1f}, "
+                        f"y={max(first.bbox[1], second.bbox[1]):.1f}: "
+                        f"'{first.text.strip()[:32]}' over "
+                        f"'{second.text.strip()[:32]}'"
+                    ),
+                )
+            )
+            overlap_reported += 1
+            if overlap_reported >= 3:
+                break
+        if overlap_reported >= 3:
+            break
+
+    original_has_bold = any(
+        "bold" in span.font.lower()
+        and len(_CJK_HAN_RE.findall(span.text)) + len(span.text.strip()) >= 6
+        for block in _text_blocks(original_page)
+        if any(
+            left
+            <= (block.bbox[0] + block.bbox[2]) / 2.0
+            <= right
+            and top
+            <= (block.bbox[1] + block.bbox[3]) / 2.0
+            <= bottom
+            for left, top, right, bottom in (
+                reference_regions
+                if reference_regions is not None
+                else _reference_region_bboxes(original_page, reference_y)
+            )
+        )
+        for span in block.spans
+    )
+    if not original_has_bold:
+        for span in spans:
+            if "bold" not in span.font.lower():
+                continue
+            stripped = span.text.strip()
+            if len(stripped) < 6:
+                continue
+            issues.append(
+                _issue(
+                    page_number,
+                    "reference_bold_style",
+                    (
+                        f"Page {page_number}: bold weight injected into "
+                        f"references at x={span.bbox[0]:.1f}, "
+                        f"y={span.bbox[1]:.1f}: '{stripped[:40]}'"
+                    ),
+                    severity="warning",
+                )
+            )
+            break
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# untranslated paragraphs
+# ---------------------------------------------------------------------------
+
+
+_STOPWORD_RE = re.compile(
+    r"\b(?:the|is|are|was|were|of|and|to|in|for|with|that|this|which|from|by)\b",
+    re.IGNORECASE,
+)
+_SHORT_FORMULA_PROSE_CUE_RE = re.compile(
+    r"\b(?:where|with|such\s+that|for\s+any|denotes?|represents?|is|are)\b",
+    re.IGNORECASE,
+)
+_AFFILIATION_RE = re.compile(
+    r"University|Institute|Institution|School|Sch\.|Laboratory|Lab\b|"
+    r"Department|Dept\.|College|Academy|Corresponding|Email|@|"
+    r"\.edu\b|\.com\b|\.cn\b|\.org\b|Univ\.",
+    re.IGNORECASE,
+)
+_BIBLIOGRAPHY_MARKER_RE = re.compile(
+    r"\bIn:\s|\(\d{4}\)|\bpp\.\s?\d|\bvol\.\s?\d|arXiv|\bdoi\b|proceedings of",
+    re.IGNORECASE,
+)
+_PSEUDOCODE_LINE_RE = re.compile(r"\b\d{1,2}:\s*[A-Z]")
+# Quoted sample/prompt boxes ("Title: ...", "Poor English input: ...",
+# "Q: ... A: ...") are evidentiary content that stays verbatim by design.
+# Scans anywhere because PyMuPDF merges consecutive lines without spaces
+# ("...SplitSubtitle: Those..."), hiding line-initial labels.
+_EXAMPLE_LABEL_RE = re.compile(
+    r"[A-Z][a-zA-Z]{0,20}(?:\s[a-zA-Z]{1,15}){0,3}:\s*[\"'A-Z0-9]"
+)
+_PSEUDOCODE_KEYWORD_RE = re.compile(
+    r"(?<![A-Za-z])(?:Update|Initialize|Compute|Return|Require|Ensure|Input|"
+    r"Output|Apply|Sample|repeat|until|while|end\s+(?:for|while|if))(?![a-z])"
+)
+
+
+_SAMPLE_LABEL_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:Q|A|Question|Answer|Input|Output|Prompt|Human|Assistant|User|"
+    r"System|Title|Subtitle)\s*[:\uff1a]|"
+    r"(?:Context|Target\s+Completion)\s*(?:→|->|\?)|"
+    r"Example\s+for\b[^:\uff1a]{0,120}[:\uff1a])",
+    re.IGNORECASE,
+)
+_AUTHOR_NOTE_RE = re.compile(
+    r"\b(?:authors?\s+(?:are\s+)?listed|author(?:s|ship)?\s+order|"
+    r"alphabetical\s+order|equal(?:ly)?\s+contribut(?:ed|ion|ions)?|"
+    r"contributions?\s+(?:are\s+)?listed)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_aligned_preserved_rows(block: _Block) -> bool:
+    """Recognize borderless parameter and formula-description tables."""
+    spans = [span for span in block.spans if span.text.strip()]
+    rows: List[List[_Span]] = []
+    for span in sorted(
+        spans,
+        key=lambda item: ((item.bbox[1] + item.bbox[3]) / 2.0, item.bbox[0]),
+    ):
+        center_y = (span.bbox[1] + span.bbox[3]) / 2.0
+        for row in rows:
+            row_center = _median(
+                [(item.bbox[1] + item.bbox[3]) / 2.0 for item in row]
+            )
+            if abs(center_y - row_center) <= 2.5:
+                row.append(span)
+                break
+        else:
+            rows.append([span])
+    if len(rows) < 4:
+        return False
+
+    percentage_rows = [
+        sorted((span for span in row
+                if re.fullmatch(r"\d+(?:\.\d+)?%", span.text.strip())),
+               key=lambda span: span.bbox[0])
+        for row in rows
+    ]
+    percentage_rows = [row for row in percentage_rows if len(row) >= 3]
+    if len(percentage_rows) >= 4:
+        columns = len(percentage_rows[0])
+        aligned = [row for row in percentage_rows if len(row) == columns]
+        # Summary cells may shift a value to make room for an adjacent n=...
+        # note. Establish the grid from a consistent majority of data rows.
+        if len(aligned) >= 4 and any(
+            sum(all(
+                min(abs(anchor(row[column].bbox) - anchor(template[column].bbox))
+                    for anchor in (lambda box: box[0], lambda box: box[2],
+                                   lambda box: (box[0] + box[2]) / 2)) <= 3
+                for column in range(columns)
+            ) for row in aligned) >= max(4, len(aligned) * 0.7)
+            for template in aligned
+        ):
+            return True
+    if re.search(r"[.!?](?:\s|$)", block.text):
+        return False
+
+    first_row = sorted(rows[0], key=lambda item: item.bbox[0])
+    if (
+        len(first_row) >= 3
+        and sum(right.bbox[0] - left.bbox[2] >= 12
+                for left, right in zip(first_row, first_row[1:])) >= 2
+        and all(len(re.findall(r"[A-Za-z]+", span.text)) <= 4 for span in first_row[:-1])
+        and all(all(abs(span.bbox[0] - first_row[-1].bbox[0]) <= 3
+                        for span in row) for row in rows[1:])
+    ):
+        return True
+
+    structural_rows = 0
+    numeric_grid_ends: List[Tuple[float, float]] = []
+    for row in rows:
+        ordered = sorted(row, key=lambda item: item.bbox[0])
+        gaps = [
+            (ordered[index + 1].bbox[0] - ordered[index].bbox[2], index)
+            for index in range(len(ordered) - 1)
+        ]
+        if not gaps:
+            continue
+        largest_gap, split_index = max(gaps)
+        if largest_gap < 12.0:
+            continue
+        value_spans = ordered[split_index + 1 :]
+        value_text = "".join(span.text for span in value_spans)
+        if not (
+            re.search(r"\d|[=<>▷τλ%]", value_text)
+            or any(_MATH_FONT_RE.search(span.font) for span in value_spans)
+        ):
+            continue
+        structural_rows += 1
+        if (
+            sum(gap >= 12.0 for gap, _ in gaps) >= 3
+            and len(ordered) >= 4
+            and all(re.fullmatch(r"\d+", span.text.strip()) for span in ordered[-2:])
+        ):
+            numeric_grid_ends.append((ordered[-2].bbox[2], ordered[-1].bbox[2]))
+    if len(numeric_grid_ends) >= 3 and all(
+        max(pair[column] for pair in numeric_grid_ends)
+        - min(pair[column] for pair in numeric_grid_ends) <= 3.0
+        for column in (0, 1)
+    ):
+        # A section heading or wrapped note can share a PDF object with three
+        # table rows. Repeated numeric columns establish a grid independently
+        # of the prose in those extra rows.
+        return True
+    return structural_rows >= max(4, int(len(rows) * 0.6))
+
+
+def _looks_like_preserved_formula_paragraph(block: _Block) -> bool:
+    """A math-dense paragraph deliberately kept in source typesetting."""
+    spans = [span for span in block.spans if span.text.strip() and span.visible]
+    total = sum(len(span.text.strip()) for span in spans)
+    if not total or block.cjk_chars() > 0:
+        return False
+    math_chars = sum(
+        len(span.text.strip())
+        for span in spans
+        if _MATH_FONT_RE.search(span.font)
+    )
+    symbols = len(
+        re.findall(r"[∈∂∑∏√≤≥≈×·∇∞→←↔α-ωΑ-Ω]", block.text)
+    )
+    return (
+        math_chars / total >= 0.12
+        or symbols / max(1, len(block.text)) >= 0.035
+    )
+
+
+def _looks_like_preserved_table_grid(block: _Block) -> bool:
+    """Recognize a borderless result table whose cells stay in the source.
+
+    Such blocks span several cells per row, so their text reads like prose but
+    the preserved-cell X positions repeat down the page. Requiring repeated
+    column starts keeps ordinary wrapped paragraphs (one span per line) from
+    being exempted as tables.
+    """
+    spans = [span for span in block.spans if span.text.strip()]
+    if len(spans) < 8:
+        return False
+    rows: List[List[_Span]] = []
+    for span in sorted(
+        spans,
+        key=lambda item: ((item.bbox[1] + item.bbox[3]) / 2.0, item.bbox[0]),
+    ):
+        center_y = (span.bbox[1] + span.bbox[3]) / 2.0
+        for row in rows:
+            row_center = _median(
+                [(item.bbox[1] + item.bbox[3]) / 2.0 for item in row]
+            )
+            if abs(center_y - row_center) <= 2.5:
+                row.append(span)
+                break
+        else:
+            rows.append([span])
+    if len(rows) < 4:
+        return False
+    multi_column_rows = 0
+    column_starts: List[float] = []
+    for row in rows:
+        ordered = sorted(row, key=lambda item: item.bbox[0])
+        gaps = [
+            ordered[index + 1].bbox[0] - ordered[index].bbox[2]
+            for index in range(len(ordered) - 1)
+        ]
+        if not gaps or max(gaps) < 10.0:
+            continue
+        multi_column_rows += 1
+        column_starts.append(ordered[0].bbox[0])
+        if len(ordered) > 1:
+            column_starts.append(ordered[1].bbox[0])
+    if multi_column_rows < max(4, int(len(rows) * 0.6)):
+        return False
+    clusters: List[List[float]] = []
+    for start in sorted(column_starts):
+        for cluster in clusters:
+            if abs(start - cluster[-1]) <= 6.0:
+                cluster.append(start)
+                break
+        else:
+            clusters.append([start])
+    return sum(1 for cluster in clusters if len(cluster) >= 3) >= 2
+
+
+def _on_float_side_of_caption(
+    block_bbox: BBox,
+    caption_kinds: Sequence[Tuple[BBox, str]],
+) -> bool:
+    """Whether the block sits on the float side of a nearby caption.
+
+    Figure captions sit below their float, table captions on either side
+    of theirs (arXiv styles use both). Quoted evidence inside the float is
+    verbatim by design; prose on the body side of a figure caption is
+    ordinary text (the GuidedVLA V-A case: analysis prose below a figure
+    caption must stay flagged).
+    """
+    bx0, by0, bx1, by1 = block_bbox
+    for (cx0, cy0, cx1, cy1), kind in caption_kinds:
+        if min(bx1, cx1) - max(bx0, cx0) <= 0.0:
+            continue
+        if kind == "figure" and by1 <= cy0 + 4.0 and cy0 - by1 <= 150.0:
+            return True
+        if kind == "table" and by0 >= cy1 - 4.0 and by0 - cy1 <= 150.0:
+            return True
+        if kind == "table" and by1 <= cy0 + 4.0:
+            # Bottom-set table caption: the table body is everything above.
+            return True
+    return False
+
+
+def _looks_like_subfigure_caption(
+    block_bbox: BBox,
+    text: str,
+    caption_kinds: Sequence[Tuple[BBox, str]],
+) -> bool:
+    """Identify prose panel captions next to the numbered figure caption."""
+    if not re.match(r"^\s*\([a-z]\)\s+[A-Z]", text):
+        return False
+    if len(_STOPWORD_RE.findall(text)) < 2:
+        return False
+    bx0, by0, bx1, by1 = block_bbox
+    for (cx0, cy0, cx1, cy1), kind in caption_kinds:
+        if kind != "figure":
+            continue
+        horizontal_overlap = min(bx1, cx1) - max(bx0, cx0)
+        if horizontal_overlap <= 0:
+            continue
+        if -6.0 <= cy0 - by1 <= 48.0 or -6.0 <= by0 - cy1 <= 48.0:
+            return True
+    return False
+
+
+def _native_formula_connectives_only(block: _Block) -> bool:
+    """Short connective words inside an otherwise native symbolic condition."""
+    ordinary = [span.text.strip() for span in block.spans
+                if span.text.strip() and not _MATH_FONT_RE.search(span.font)
+                and not re.search(r"CM(?:TI|SS|BX)\d", span.font, re.I)]
+    return bool(
+        ordinary
+        and all(re.fullmatch(r"such\s+that|is\s+satisfiable", text, re.I)
+                for text in ordinary)
+        and block.latin_words() <= 7
+        and len(re.findall(r"[=<>∈∃∀⇐⇒∧∨|]", block.text)) >= 3
+    )
+
+
+def _source_reference_list_owns_block(block: _Block, sources: Sequence[_Block]) -> bool:
+    """Carry confirmed source list ownership across target PDF object splits."""
+    from .pdf_layout import _looks_like_supplement_reference_list
+
+    compact = re.sub(r"\s+", "", block.text)
+    return bool(compact and any(
+        _looks_like_supplement_reference_list(source.text)
+        and _bbox_overlap_area(block.bbox, source.bbox) >= _bbox_area(block.bbox) * 0.95
+        and compact in re.sub(r"\s+", "", source.text)
+        for source in sources
+    ))
+
+
+def _untranslated_block_issues(
+    translated_page: object,
+    page_number: int,
+    *,
+    original_page: Optional[object] = None,
+    reference_y: Optional[float],
+    reference_regions: Sequence[BBox] = (),
+    table_bands: Sequence[BBox] = (),
+    preserved_regions: Sequence[BBox] = (),
+    algorithm_regions: Sequence[BBox] = (),
+    caption_kinds: Sequence[Tuple[BBox, str]] = (),
+    graphic_regions: Sequence[BBox] = (),
+) -> List[object]:
+    """Paragraphs of running English prose left in the translated page.
+
+    Gates are text-based rather than region-based on purpose: a
+    mis-detected preserved region is precisely how prose escapes
+    translation, so trusting those regions here would hide the defect
+    (GuidedVLA section V-A, 2026-08-11). Author lists, figure legends,
+    references and config tables carry almost no English stopwords and
+    stay exempt. Two deliberate exceptions cover quoted evidence kept
+    verbatim by policy: algorithm floats (GPT-3 style prompt/completion
+    samples), and preserved content that starts with a sample label or
+    sits on the float side of an adjacent caption (chain-of-thought
+    exemplar boxes, dataset table cells, figure-embedded instructions).
+    """
+    from .pdf_layout import (
+        _PROMPT_TEMPLATE_RE,
+        _VERBATIM_GENERATED_SAMPLE_RE,
+        _formatted_dataset_example_region_bboxes,
+        _is_reference_or_formula_text,
+        _looks_like_structural_english_metadata,
+    )
+
+    issues: List[object] = []
+    source_blocks = _text_blocks(original_page) if original_page is not None else []
+    generated_sample_labels = [
+        source.bbox
+        for source in source_blocks
+        if _VERBATIM_GENERATED_SAMPLE_RE.search(" ".join(source.text.split()))
+    ]
+    formatted_dataset_regions = (
+        _formatted_dataset_example_region_bboxes(original_page, source_blocks)
+        if original_page is not None
+        else []
+    )
+    for block in _text_blocks(translated_page):
+        text = " ".join(block.text.split())
+        if not text:
+            continue
+        if _looks_like_structural_english_metadata(text):
+            # Author lists, affiliation footnotes and code/URL lines are kept
+            # in the source language by product policy.
+            continue
+        # Running headers repeat the paper title verbatim on every page after
+        # the first; they are metadata, not untranslated body prose.
+        if (
+            page_number > 1
+            and original_page is not None
+            and block.bbox[3] <= original_page.rect.height * 0.09
+            and len(text) <= 200
+            and any(
+                "".join(source.text.split()) == "".join(block.text.split())
+                and abs(source.bbox[1] - block.bbox[1]) <= 6.0
+                for source in source_blocks
+            )
+        ):
+            continue
+        if _source_reference_list_owns_block(block, source_blocks):
+            continue
+        if _native_formula_connectives_only(block) and any(
+            "".join(source.text.split()) == "".join(block.text.split())
+            and _bbox_overlap_area(block.bbox, source.bbox) >= _bbox_area(block.bbox) * 0.95
+            for source in source_blocks
+        ):
+            continue
+        if _VERBATIM_GENERATED_SAMPLE_RE.search(text):
+            continue
+        if _PROMPT_TEMPLATE_RE.search(text):
+            # System/evaluator prompt templates are quoted verbatim.
+            continue
+        if any(
+            min(block.bbox[2], label[2]) - max(block.bbox[0], label[0]) > 0.0
+            and -4.0 <= block.bbox[1] - label[3] <= 520.0
+            for label in generated_sample_labels
+        ):
+            continue
+        words = block.latin_words()
+        stopwords = len(_STOPWORD_RE.findall(text))
+        cjk = block.cjk_chars()
+        math_chars = sum(
+            len(span.text.strip())
+            for span in block.spans
+            if _MATH_FONT_RE.search(span.font)
+        )
+        total_chars = sum(len(span.text.strip()) for span in block.spans)
+        short_formula_prose = bool(
+            cjk == 0
+            and 2 <= words < _UNTRANSLATED_MIN_WORDS
+            and math_chars >= 1
+            and total_chars
+            and math_chars / total_chars <= 0.85
+            and _SHORT_FORMULA_PROSE_CUE_RE.search(text)
+        )
+        formula_connective_prose = bool(
+            cjk == 0
+            and 1 <= words <= 4
+            and re.match(r"^(?:where|with|and|for|from)\b", text, re.IGNORECASE)
+            and re.search(r"[^A-Za-z0-9\s.,;:()\-]", text)
+        )
+        if formula_connective_prose:
+            continue
+        panel_caption = _looks_like_subfigure_caption(
+            block.bbox,
+            text,
+            caption_kinds,
+        )
+        content_spans = [span for span in block.spans if span.text.strip()]
+        formatted_sample_spans = sum(
+            1
+            for span in content_spans
+            if any(
+                region[0] - 2.0
+                <= (span.bbox[0] + span.bbox[2]) / 2.0
+                <= region[2] + 2.0
+                and region[1] - 2.0
+                <= (span.bbox[1] + span.bbox[3]) / 2.0
+                <= region[3] + 2.0
+                for region in formatted_dataset_regions
+            )
+        )
+        if (
+            content_spans
+            and formatted_sample_spans >= 0.7 * len(content_spans)
+        ):
+            continue
+        if algorithm_regions and any(
+            _bbox_overlap_area(block.bbox, region) > 0.6 * _bbox_area(block.bbox)
+            for region in algorithm_regions
+        ):
+            continue
+        graphic_covered_spans = sum(
+            1
+            for span in content_spans
+            if any(
+                region[0] - 2.0
+                <= (span.bbox[0] + span.bbox[2]) / 2.0
+                <= region[2] + 2.0
+                and region[1] - 2.0
+                <= (span.bbox[1] + span.bbox[3]) / 2.0
+                <= region[3] + 2.0
+                for region in graphic_regions
+            )
+        )
+        if not panel_caption and graphic_regions and (
+            any(
+                _bbox_overlap_area(block.bbox, region) > 0.6 * _bbox_area(block.bbox)
+                for region in graphic_regions
+            )
+            or (
+                content_spans
+                and graphic_covered_spans >= 0.7 * len(content_spans)
+            )
+        ):
+            # preserve_graphics_text keeps figure-internal text verbatim by
+            # design; English inside a graphic envelope is not a miss.
+            continue
+        # Table walls fragment into one preserved strip per cell while the
+        # extracted block spans whole rows including the gaps, so coverage
+        # is judged span by span rather than on the block envelope.
+        covered_spans = sum(
+            1
+            for span in content_spans
+            if any(
+                region[0] - 2.0 <= (span.bbox[0] + span.bbox[2]) / 2.0 <= region[2] + 2.0
+                and region[1] - 2.0 <= (span.bbox[1] + span.bbox[3]) / 2.0 <= region[3] + 2.0
+                for region in preserved_regions
+            )
+        )
+        if content_spans and covered_spans >= 0.7 * len(content_spans):
+            text_head = " ".join(block.text.split())
+            if _SAMPLE_LABEL_PREFIX_RE.match(text_head):
+                continue
+            if _looks_like_aligned_preserved_rows(block):
+                continue
+            if _looks_like_preserved_formula_paragraph(block):
+                continue
+            if block.cjk_chars() == 0 and any(
+                _bbox_overlap_area(block.bbox, region)
+                >= 0.7 * _bbox_area(block.bbox)
+                for region in preserved_regions
+            ):
+                # A complete English paragraph inside one preserved envelope
+                # was kept verbatim by policy (dense-formula paragraph). It is
+                # not an extraction miss; visual ink checks still apply.
+                continue
+            if _looks_like_preserved_table_grid(block):
+                continue
+            if any(
+                _bbox_overlap_area(block.bbox, region)
+                >= 0.8 * _bbox_area(block.bbox)
+                and _bbox_area(region) >= 2.5 * _bbox_area(block.bbox)
+                for region in preserved_regions
+            ):
+                # The block is one cell run inside a large preserved table or
+                # float envelope (borderless comparison tables keep every cell
+                # verbatim). A preserved ordinary paragraph owns a region the
+                # size of the block itself, so it still reports as untranslated.
+                continue
+            if (
+                not panel_caption
+                and stopwords < max(2.0, words / 7.0)
+                and _on_float_side_of_caption(block.bbox, caption_kinds)
+            ):
+                continue
+        center_x = (block.bbox[0] + block.bbox[2]) / 2.0
+        center_y = (block.bbox[1] + block.bbox[3]) / 2.0
+        if any(
+            left <= center_x <= right and top <= center_y <= bottom
+            for left, top, right, bottom in reference_regions
+        ) or (
+            not reference_regions
+            and reference_y is not None
+            and block.bbox[1] >= reference_y - 4.0
+        ):
+            continue
+        if words < _UNTRANSLATED_MIN_WORDS and not short_formula_prose:
+            continue
+        if cjk >= max(4, words // 8):
+            continue
+        if re.match(r"^\s*(Figure|Table|Algorithm)\s+\d", text):
+            continue
+        if stopwords < 2 and not short_formula_prose:
+            continue
+        if page_number == 1 and _AUTHOR_NOTE_RE.search(text):
+            continue
+        affiliation_hits = len(_AFFILIATION_RE.findall(text))
+        if affiliation_hits >= 2 or (page_number == 1 and affiliation_hits >= 1):
+            continue
+        if (
+            len(_PSEUDOCODE_LINE_RE.findall(text)) >= 2
+            or len(_PSEUDOCODE_KEYWORD_RE.findall(text)) >= 2
+        ):
+            continue
+        if len(_EXAMPLE_LABEL_RE.findall(text)) >= 2:
+            continue
+        if _is_reference_or_formula_text(text) and not short_formula_prose:
+            continue
+        # Rows inside a rendered table grid are preserved cell text, not
+        # missed prose.
+        attached_preserved_table_note = bool(
+            content_spans
+            and covered_spans >= 0.7 * len(content_spans)
+            and not panel_caption
+            and _on_float_side_of_caption(block.bbox, caption_kinds)
+            and any(
+                min(block.bbox[2], right) - max(block.bbox[0], left)
+                >= 0.8 * max(1.0, block.bbox[2] - block.bbox[0])
+                and top - 4.0 <= block.bbox[1] <= bottom + 4.0
+                and block.bbox[3] - bottom <= 40.0
+                for left, top, right, bottom in table_bands
+            )
+        )
+        if attached_preserved_table_note or any(
+            left - 4.0 <= center_x <= right + 4.0
+            and top - 4.0 <= center_y <= bottom + 4.0
+            for left, top, right, bottom in table_bands
+        ):
+            continue
+        # Keyword-style preserved content (hyperparameter grids, config
+        # dumps) is intentionally verbatim. Flowing prose has a much higher
+        # stopword density, so it stays flagged even when a mis-detected
+        # preserved region covers it.
+        if not panel_caption and stopwords < max(2.0, words / 7.0) and any(
+            _bbox_overlap_area(block.bbox, region) > 0.6 * _bbox_area(block.bbox)
+            for region in preserved_regions
+        ):
+            continue
+        if total_chars and math_chars / total_chars > 0.4 and not short_formula_prose:
+            continue
+        if re.search(
+            r"<\|DSML\||You have access to a set of tools|"
+            r"String parameters should be specified|thinking_mode|"
+            r"You MUST strictly follow|complete reasoning inside|"
+            r"\b[\w-]+\.(?:sh|py|json|md|txt|yaml|yml)\b|"
+            r"^\s*(?:bash|python|\./)\s",
+            text,
+            re.IGNORECASE,
+        ):
+            # Tool-call schema / prompt scaffolding is intentionally verbatim.
+            continue
+        issues.append(
+            _issue(
+                page_number,
+                "untranslated_block",
+                (
+                    f"Page {page_number}: paragraph still in English "
+                    f"({words} words, {cjk} CJK chars) at "
+                    f"x={block.bbox[0]:.1f}, y={block.bbox[1]:.1f}: {text[:56]}"
+                ),
+            )
+        )
+        if len(issues) >= 4:
+            break
+    return issues
+
+
+_RESIDUAL_SOURCE_PROSE_CUE_RE = re.compile(
+    r"^(?:and|are|be|being|for|from|is|or|that|then|to|was|were|where|which|with|writing)$",
+    re.IGNORECASE,
+)
+
+
+def _residual_source_prose_issues(
+    original_page: object,
+    translated_page: object,
+    page_number: int,
+    source_role_blocks: Sequence[object],
+    *,
+    excluded_regions: Sequence[BBox] = (),
+) -> List[object]:
+    """Flag source prose objects that survived redaction at the same position."""
+    prose_regions = [
+        tuple(float(value) for value in region)
+        for block in source_role_blocks
+        for region in getattr(block, "source_prose_bboxes", ())
+    ]
+    if not prose_regions:
+        return []
+    formula_prose_regions = [
+        (
+            float(block.bbox[0]) - 2.0,
+            float(block.bbox[1]) - 2.0,
+            float(block.bbox[2]) + 2.0,
+            float(block.bbox[3]) + 2.0,
+        )
+        for block in source_role_blocks
+        if getattr(block, "block_type", "") == "formula_prose"
+    ]
+
+    source_spans = [span for block in _text_blocks(original_page) for span in block.spans]
+    translated_spans = [
+        span for block in _text_blocks(translated_page) for span in block.spans
+    ]
+    issues: List[object] = []
+    seen: set[Tuple[str, int, int]] = set()
+    for source_span in source_spans:
+        text = " ".join(source_span.text.split()).strip()
+        words = _LATIN_WORD_RE.findall(text)
+        if not words or _CJK_HAN_RE.search(text):
+            continue
+        if len(words) <= 2:
+            # A lone connective ("and") left at its source position is layout
+            # debris from a split paragraph, not untranslated prose.
+            continue
+        if not _RESIDUAL_SOURCE_PROSE_CUE_RE.fullmatch(text):
+            continue
+        center_x = (source_span.bbox[0] + source_span.bbox[2]) / 2.0
+        center_y = (source_span.bbox[1] + source_span.bbox[3]) / 2.0
+        if any(
+            left - 1.0 <= center_x <= right + 1.0
+            and top - 1.0 <= center_y <= bottom + 1.0
+            for left, top, right, bottom in formula_prose_regions
+        ):
+            # Formula explanations keep their connective word + math glyphs
+            # verbatim by design ("where Q ...").
+            continue
+        if any(
+            left - 1.0 <= center_x <= right + 1.0
+            and top - 1.0 <= center_y <= bottom + 1.0
+            for left, top, right, bottom in excluded_regions
+        ):
+            continue
+        if not any(
+            left - 0.5 <= center_x <= right + 0.5
+            and top - 0.5 <= center_y <= bottom + 0.5
+            for left, top, right, bottom in prose_regions
+        ):
+            continue
+        duplicate = next(
+            (
+                candidate
+                for candidate in translated_spans
+                if " ".join(candidate.text.split()).strip() == text
+                and all(
+                    abs(first - second) <= 0.35
+                    for first, second in zip(candidate.bbox, source_span.bbox)
+                )
+                and candidate.font == source_span.font
+            ),
+            None,
+        )
+        if duplicate is None:
+            continue
+        key = (text.casefold(), round(center_x), round(center_y))
+        if key in seen:
+            continue
+        seen.add(key)
+        issues.append(
+            _issue(
+                page_number,
+                "untranslated_block",
+                "Source prose remained verbatim at "
+                f"x={center_x:.1f}, y={center_y:.1f}: {text[:120]}",
+            )
+        )
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+
+def inspect_translation(
+    original_pdf: Path,
+    translated_pdf: Path,
+    *,
+    max_pages: Optional[int] = None,
+    pages: Optional[Sequence[int]] = None,
+) -> List[object]:
+    """Run the visual inspection suite over an original/translated pair.
+
+    ``pages`` optionally restricts the inspection to a 0-based page subset
+    (parallel QA sharding).  The default ``None`` keeps the historical
+    behaviour of inspecting every page; ``max_pages`` still caps the number of
+    inspected pages after the subset filter.
+    """
+
+    from .pdf_layout import (
+        _combine_academic_formula_statement_translation_items,
+        _combine_formula_continuation_translation_items,
+        _combine_inline_style_translation_items,
+        _combine_list_continuation_translation_items,
+        _page_looks_like_reference_continuation,
+        _reference_section_start_y,
+        _visual_regions_for_page,
+        expand_bbox,
+        open_pdf_detached,
+        prepare_translation_units,
+    )
+
+    # Detached opens: mupdf mmaps path-opened documents and an iCloud-style
+    # eviction mid-inspection turns page faults into SIGBUS.
+    original = open_pdf_detached(original_pdf)
+    translated = open_pdf_detached(translated_pdf)
+    issues: List[object] = []
+    try:
+        preserved_regions: Dict[int, List[BBox]] = {}
+        equation_rows: Dict[int, List[BBox]] = {}
+        algorithm_regions: Dict[int, List[BBox]] = {}
+        structural_table_regions: Dict[int, List[BBox]] = {}
+        caption_bands: Dict[int, List[BBox]] = {}
+        keepouts: Dict[int, List[BBox]] = {}
+        source_role_blocks: Dict[int, List[object]] = {}
+        source_role_items: Dict[int, List[Tuple[object, str]]] = {}
+        try:
+            units, _gutters, _skipped = prepare_translation_units(
+                original,
+                preserve_graphics_text=True,
+                preserved_regions_out=preserved_regions,
+                equation_rows_out=equation_rows,
+                algorithm_regions_out=algorithm_regions,
+                table_regions_out=structural_table_regions,
+            )
+        except TypeError:
+            units, _gutters, _skipped = prepare_translation_units(
+                original,
+                preserve_graphics_text=True,
+                preserved_regions_out=preserved_regions,
+            )
+        except Exception:
+            units = []
+        graphic_regions_by_page: Dict[int, List[BBox]] = {}
+        try:
+            from .pdf_layout import collect_graphic_regions
+
+            graphic_regions_by_page = collect_graphic_regions(original)
+        except Exception:
+            graphic_regions_by_page = {}
+        caption_kinds: Dict[int, List[Tuple[BBox, str]]] = {}
+        for unit_block, _prompt, _mapping in units:
+            source_role_items.setdefault(unit_block.page_index, []).append(
+                (unit_block, unit_block.text)
+            )
+            if unit_block.block_type == "caption":
+                caption_bands.setdefault(unit_block.page_index, []).append(
+                    expand_bbox(unit_block.bbox, 2.0)
+                )
+                caption_text = " ".join(unit_block.text.split()).lstrip()
+                kind = (
+                    "table"
+                    if re.match(r"^(?:Table|Tab\.|表)\s*\d", caption_text, re.IGNORECASE)
+                    else "figure"
+                )
+                caption_kinds.setdefault(unit_block.page_index, []).append(
+                    (expand_bbox(unit_block.bbox, 2.0), kind)
+                )
+            for keepout in unit_block.keepout_bboxes or []:
+                keepouts.setdefault(unit_block.page_index, []).append(keepout)
+
+        for page_index, role_items in source_role_items.items():
+            combined_role_items = _combine_formula_continuation_translation_items(
+                _combine_academic_formula_statement_translation_items(
+                    _combine_list_continuation_translation_items(
+                        _combine_inline_style_translation_items(role_items)
+                    )
+                )
+            )
+            source_role_blocks[page_index] = [
+                block for block, _text in combined_role_items
+            ]
+
+        total_pages = min(original.page_count, translated.page_count)
+        if pages is None:
+            desired_pages = list(range(total_pages))
+        else:
+            target_pages = {int(page) for page in pages}
+            desired_pages = sorted(
+                page for page in target_pages if 0 <= page < total_pages
+            )
+        if max_pages is not None:
+            desired_pages = desired_pages[:max_pages]
+        desired_page_set = set(desired_pages)
+        page_count = max(desired_pages) + 1 if desired_pages else 0
+
+        def page_reference_state(
+            index: int,
+            original_page: object,
+            translated_page: object,
+            active: bool,
+        ) -> Tuple[Optional[float], Optional[List[BBox]], bool]:
+            reference_y = _reference_section_start_y(translated_page)
+            if reference_y is None:
+                reference_y = _reference_section_start_y(original_page)
+            section_headings = [
+                block
+                for block in source_role_blocks.get(index, ())
+                if getattr(block, "block_type", "") in {"title", "heading"}
+                and bool(getattr(block, "should_translate", True))
+            ]
+            carried: Optional[List[BBox]] = None
+            if reference_y is not None:
+                active = True
+            elif active and (
+                _page_looks_like_reference_continuation(translated_page)
+                or _page_looks_like_reference_continuation(original_page)
+                # Continuation pages whose entries merged into large blocks
+                # defeat the entry-level heuristics; bibliography markers
+                # (In:, years, arXiv, pp.) still give them away.
+                or len(
+                    _BIBLIOGRAPHY_MARKER_RE.findall(translated_page.get_text("text"))
+                )
+                >= 4
+            ):
+                carried = _reference_continuation_regions(
+                    original_page,
+                    source_role_blocks.get(index, ()),
+                )
+                if carried:
+                    reference_y = 0.0
+                active = bool(carried) and not bool(section_headings)
+            else:
+                active = False
+            return reference_y, carried, active
+
+        reference_active = False
+        for index in range(page_count):
+            original_page = original[index]
+            translated_page = translated[index]
+            page_number = index + 1
+            if index not in desired_page_set:
+                # Advance the cross-page reference-section state while
+                # skipping the checks for pages outside the requested subset.
+                _, _, reference_active = page_reference_state(
+                    index, original_page, translated_page, reference_active
+                )
+                continue
+            page_regions = preserved_regions.get(index, [])
+            raw_graphic_regions = graphic_regions_by_page.get(index, [])
+            page_figure_regions = _figure_graphic_regions(
+                raw_graphic_regions,
+                caption_kinds.get(index, []),
+            )
+            page_figure_regions.extend(
+                _preserved_regions_above_figure_captions(
+                    page_regions,
+                    caption_kinds.get(index, []),
+                )
+            )
+            page_keepouts = keepouts.get(index, [])
+            page_captions = caption_bands.get(index, [])
+            (
+                reference_y,
+                carried_reference_regions,
+                reference_active,
+            ) = page_reference_state(
+                index, original_page, translated_page, reference_active
+            )
+
+            exclusions: List[BBox] = list(page_regions) + list(page_keepouts)
+            original_ink = _InkCache(original_page)
+            translated_ink = _InkCache(translated_page)
+            original_rules, original_curves = _page_line_art(original_page)
+            translated_rules, _ = _page_line_art(translated_page)
+            table_bands: List[BBox] = []
+            for cluster in _rule_clusters(translated_rules):
+                left = max(rule[1] for rule in cluster)
+                right = min(rule[2] for rule in cluster)
+                if right <= left:
+                    left = min(rule[1] for rule in cluster)
+                    right = max(rule[2] for rule in cluster)
+                table_bands.append(
+                    (left, cluster[0][0], right, cluster[-1][0])
+                )
+            table_bands.extend(_line_table_bboxes(translated_page))
+            table_bands.extend(structural_table_regions.get(index, ()))
+
+            try:
+                translated_graphic_regions = _visual_regions_for_page(
+                    translated_page,
+                    blocks=_page_text_dict(translated_page).get("blocks", []),
+                )
+            except Exception:
+                translated_graphic_regions = []
+            issues.extend(
+                _text_visual_overlap_issues(
+                    original_page,
+                    translated_page,
+                    page_number,
+                    original_visual_regions=_tight_visual_regions(
+                        original_page, raw_graphic_regions
+                    ),
+                    translated_visual_regions=translated_graphic_regions,
+                    caption_regions=page_captions,
+                    preserved_regions=page_regions,
+                    table_bands=table_bands,
+                )
+            )
+            reference_regions = (
+                carried_reference_regions
+                if carried_reference_regions is not None
+                else _reference_region_bboxes(original_page, reference_y)
+            )
+
+            issues.extend(
+                _font_size_issues(
+                    original_page,
+                    translated_page,
+                    page_number,
+                    # Panel captions, labels inside a figure envelope and
+                    # translated float captions are re-typeset at a smaller
+                    # size to fit their fixed band; the float is stamped and
+                    # cannot collide.
+                    exclusion_bboxes=[
+                        *exclusions,
+                        *page_figure_regions,
+                        *page_captions,
+                    ],
+                    source_role_blocks=source_role_blocks.get(index, ()),
+                )
+            )
+            issues.extend(
+                _preserved_region_issues(
+                    original_ink,
+                    translated_ink,
+                    page_number,
+                    page_regions,
+                    page_captions,
+                )
+            )
+            issues.extend(
+                _math_clip_issues(
+                    original_page,
+                    original_ink,
+                    translated_page,
+                    translated_ink,
+                    page_number,
+                )
+            )
+            issues.extend(
+                _table_structure_issues(
+                    page_number,
+                    original_rules,
+                    original_curves,
+                    translated_rules,
+                    original_page=original_page,
+                    translated_page=translated_page,
+                    preserved_regions=page_regions,
+                    graphic_regions=page_figure_regions,
+                )
+            )
+            issues.extend(
+                _table_cell_layout_issues(
+                    page_number,
+                    original_page,
+                    translated_page,
+                    original_rules,
+                    excluded_regions=[*page_regions, *page_figure_regions],
+                )
+            )
+            issues.extend(
+                _frame_overflow_issues(
+                    page_number,
+                    original_page,
+                    translated_page,
+                    excluded_regions=page_figure_regions,
+                )
+            )
+            issues.extend(
+                _display_alignment_issues(
+                    original_ink,
+                    translated_ink,
+                    page_number,
+                    equation_rows.get(index, []),
+                    algorithm_regions=algorithm_regions.get(index, []),
+                    table_regions=table_bands,
+                    source_role_blocks=source_role_blocks.get(index, ()),
+                )
+            )
+            issues.extend(
+                _reference_issues(
+                    original_page,
+                    translated_page,
+                    page_number,
+                    reference_y,
+                    source_role_blocks=source_role_blocks.get(index, ()),
+                    reference_regions=reference_regions,
+                )
+            )
+            issues.extend(
+                _untranslated_block_issues(
+                    translated_page,
+                    page_number,
+                    original_page=original_page,
+                    reference_y=reference_y,
+                    reference_regions=reference_regions,
+                    table_bands=table_bands,
+                    preserved_regions=page_regions,
+                    algorithm_regions=algorithm_regions.get(index, []),
+                    caption_kinds=caption_kinds.get(index, []),
+                    graphic_regions=page_figure_regions,
+                )
+            )
+            issues.extend(
+                _residual_source_prose_issues(
+                    original_page,
+                    translated_page,
+                    page_number,
+                    source_role_blocks.get(index, ()),
+                    excluded_regions=[
+                        *reference_regions,
+                        *table_bands,
+                        *page_regions,
+                        *algorithm_regions.get(index, ()),
+                        *page_figure_regions,
+                    ],
+                )
+            )
+    finally:
+        translated.close()
+        original.close()
+    return issues

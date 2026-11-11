@@ -1,0 +1,5 @@
+# paperex 后端开发依赖（运行依赖见 requirements.txt）
+pytest>=8.0
+pytest-asyncio>=0.23
+ruff>=0.5
+# httpx 已在 requirements.txt 中（TestClient / test-connection 需要）

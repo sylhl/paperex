@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="mint" data-mode="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <title>paperex</title>
+    <script>
+      ;(function () {
+        try {
+          var themes = ['mint', 'ocean', 'peach', 'lemon', 'grape', 'rose']
+          var savedTheme = localStorage.getItem('paperex.theme')
+          var theme = themes.indexOf(savedTheme) === -1 ? 'mint' : savedTheme
+          var mode = localStorage.getItem('paperex.mode')
+          if (mode !== 'light' && mode !== 'dark') {
+            mode = savedTheme === 'paper' ? 'light' : 'dark'
+          }
+          document.documentElement.dataset.theme = theme
+          document.documentElement.dataset.mode = mode
+        } catch (error) {}
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

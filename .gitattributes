@@ -1,0 +1,26 @@
+# 归一化换行符；二进制资源不做文本处理
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
+*.zip binary
+*.7z binary
+*.exe binary
+
+# Windows 启动脚本保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 锁定语言统计
+docs/assets/** linguist-documentation
+backend/pdf_zh_translator/** linguist-vendored=false

@@ -1,0 +1,93 @@
+paperex — NOTICE / 第三方声明
+==============================
+
+本文件汇总 paperex 的许可与第三方组件声明。paperex 以 GNU Affero General
+Public License v3.0 或更高版本（AGPL-3.0-or-later）发布，完整许可文本见同目录 LICENSE。
+
+版权声明：Copyright (c) 2026 paperex contributors。
+
+`LICENSE` 文件为 Free Software Foundation 发布的 AGPL-3.0 原文（逐字未改，
+未附加前言或附加条款），目的是让 GitHub 等平台能自动识别许可证；项目的版权
+声明与上游署名均记录在本 NOTICE 中。
+
+> 变更说明：v1.0 曾以 MIT 许可证发布。自 v1.1.0 起，因捆绑的翻译引擎
+> （`backend/pdf_zh_translator/`）派生自 AGPL-3.0 上游，本仓库整体改为
+> AGPL-3.0-or-later；**旧的 MIT 声明不再适用于本仓库的任何文件**。
+
+1. 翻译引擎来源与修改声明
+--------------------------
+
+`backend/pdf_zh_translator/` 是 paperex 内置的 PDF 原位翻译引擎，非完全原创：
+
+- 引擎源自 AGPL-3.0 项目 **super_translate**（super_translate-main），
+  其根目录 LICENSE 为 GNU AGPL v3 全文；
+- super_translate 的文档与代码明确说明其中文 PDF 翻译管线 vendored 自
+  **PDFMathTranslate / pdf2zh**（AGPL-3.0）的渲染与版面处理管线；
+- paperex 在二者的基础上做了大量修改（段落对齐、标题/目录、图注续行、
+  重叠散文重排、字体别名修复、公式锚点恢复、CJK 字距与断行等，详见
+  `docs/ARCHITECTURE.md` 与 CHANGELOG），修改后的引擎代码同样以
+  **AGPL-3.0** 授权。
+
+因此 paperex 整体采用 AGPL-3.0。任何分发 paperex（含修改版）的个人或组织，
+必须按 AGPL-3.0 第 5、6、13 条的要求向接收者提供完整对应源代码。
+
+上游项目：
+- super_translate: https://github.com/asimfish/super_translate （AGPL-3.0）
+- PDFMathTranslate / pdf2zh: https://github.com/Byaidu/PDFMathTranslate （AGPL-3.0）
+
+2. 中文字体
+------------
+
+内置字体位于 `backend/assets/fonts/`，均以 **SIL Open Font License 1.1**
+（OFL-1.1）分发，允许随软件再分发与嵌入 PDF：
+
+| 字体 | 文件 | 许可证文件 |
+| --- | --- | --- |
+| 霞鹜文楷 GB（屏幕阅读版） | `LXGWWenKaiGBLite-Regular.ttf` | `OFL-LXGWWenKai.txt` |
+| 霞鹜臻楷 GB | `LXGWZhenKaiGB-Regular.ttf` | `OFL-LXGWZhenKai.txt` |
+| （通用说明） | — | `LICENSE-LXGW.txt` |
+
+字体许可证文件随字体一起分发，不得删除。字体名称与版权归原作者
+LXGW（https://github.com/lxgw/LxgwWenKai、https://github.com/lxgw/LxgwZhenKai）
+所有；如替换字体，请同样保留其 OFL 许可证文件。
+
+3. 第三方软件依赖
+------------------
+
+以下依赖通过 `backend/requirements.txt`、`frontend/package.json` 与
+`frontend/src-tauri/Cargo.toml` 引入，按各自许可证分发：
+
+| 组件 | 用途 | 许可证 |
+| --- | --- | --- |
+| PyMuPDF | PDF 结构分析、擦写、排版、QA 渲染 | AGPL-3.0 |
+| FastAPI | 本地 HTTP API | MIT |
+| Uvicorn | ASGI 服务器 | BSD-3-Clause |
+| httpx | 翻译服务 HTTP 客户端 | BSD-3-Clause |
+| python-multipart | 浏览器模式上传 | Apache-2.0 |
+| pydantic | 请求/响应模型 | MIT |
+| React / React DOM | 前端 UI | MIT |
+| pdf.js（pdfjs-dist） | 原版 PDF 渲染 | Apache-2.0 |
+| react-pdf | pdf.js 的 React 封装 | MIT |
+| Vite | 前端构建 | MIT |
+| Tailwind CSS | 样式系统 | MIT |
+| PostCSS / autoprefixer | 样式构建 | MIT |
+| Tauri 2（@tauri-apps/* 与 Rust crates） | 桌面壳 | MIT 或 Apache-2.0 |
+| WebView2 Runtime | Windows 渲染内核（系统组件，不随仓库分发） | Microsoft 专有（系统组件） |
+
+Rust 依赖的完整清单与版本见 `frontend/src-tauri/Cargo.lock`，其许可证以
+各 crate 的 `license` 字段为准（绝大多数为 MIT / Apache-2.0 双许可）。
+Python 锁定版本见 `backend/requirements.txt`；Node 依赖树见
+`frontend/package-lock.json`。
+
+可选外部组件：本仓库**不捆绑 Tesseract OCR**。若用户自行安装 Tesseract
+（Apache-2.0）及语言数据以处理扫描版 PDF，其许可证与合规义务由使用者承担。
+
+4. 仓库内容与论文版权
+----------------------
+
+- 本仓库**不包含任何论文原文或译文 PDF**。`new/`、`_work/`、翻译产物、
+  缓存与日志均在 `.gitignore` 覆盖范围内，不随仓库分发。
+- paperex 只提供本地处理工具；用户需自行确保对所处理论文的使用符合
+  出版方版权与所在地区法律（例如仅作个人阅读辅助）。
+- README 与 docs 中的实测截图使用公开 arXiv/OSDI 样张，截图仅展示界面
+  与版式效果，用于说明软件能力。

@@ -61,6 +61,8 @@ translation-cache.jsonl
 /release/
 *.zip
 *.7z
+# PyInstaller 冻结后端的中间产物（backend/dist/ 已在上方忽略）
+backend/packaging/_build/
 
 # ---------- 系统 / 编辑器 ----------
 .DS_Store

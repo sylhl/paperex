@@ -44,6 +44,25 @@ def worker_path() -> Path:
     return Path(__file__).resolve().parent / "qa_worker.py"
 
 
+def is_frozen() -> bool:
+    """True when running from the PyInstaller bundle of the desktop app."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def worker_command(spec_path: Path, python_exe: Optional[str] = None) -> List[str]:
+    """Command line for one isolated checker process.
+
+    In the frozen desktop build the bundled ``paperex-server.exe`` is both the
+    API server and the QA worker (switch: ``--qa-worker``), so an installed
+    copy never needs a system Python. During development we keep spawning
+    ``python qa_worker.py`` exactly as before.
+    """
+    if is_frozen():
+        return [sys.executable, "--qa-worker", str(spec_path)]
+    interpreter = python_exe or sys.executable
+    return [interpreter, str(worker_path()), str(spec_path)]
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -155,7 +174,7 @@ def run_checkers(
         specs[checker] = result_path
         try:
             process = subprocess.Popen(
-                [python_exe, str(worker_path()), str(spec_path)],
+                worker_command(spec_path, python_exe),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 cwd=str(Path(__file__).resolve().parent),
@@ -419,11 +438,13 @@ __all__ = [
     "QaResult",
     "build_report",
     "evaluate",
+    "is_frozen",
     "load_report",
     "qa_timeout_s",
     "run_checkers",
     "status_for",
     "summarize",
+    "worker_command",
     "worker_path",
     "write_report",
 ]

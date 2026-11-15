@@ -89,7 +89,7 @@ from jobs import (
 # =================================================================
 
 APP_NAME = "paperex"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 HOST = "127.0.0.1"
 PORT = 8756
 

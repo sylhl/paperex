@@ -58,9 +58,38 @@ fn find_backend_dir() -> Option<PathBuf> {
     None
 }
 
-/// 拉起 FastAPI 后端：隐藏控制台窗口，输出全部丢弃
-fn spawn_backend() -> Option<Child> {
-    let dir = find_backend_dir()?;
+/// 安装包内置后端：tauri 把 `backend/dist/paperex-server/` 打包进
+/// 资源目录的 `backend/` 下；Windows 上资源目录就是 exe 所在目录。
+fn find_bundled_server() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let candidates = [
+        dir.join("backend").join("paperex-server.exe"),
+        dir.join("backend").join("paperex-server").join("paperex-server.exe"),
+        dir.join("resources").join("backend").join("paperex-server.exe"),
+        dir.join("resources").join("backend").join("paperex-server").join("paperex-server.exe"),
+    ];
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// 隐藏控制台窗口、输出丢弃、强制 UTF-8 的通用设置。
+fn hidden(cmd: &mut Command) -> &mut Command {
+    cmd.env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// 源码模式下用项目虚拟环境里的 Python 拉起 `uvicorn main:app`。
+fn spawn_python_backend(dir: &std::path::Path) -> Option<Child> {
     // 优先使用项目自带的虚拟环境，避免系统 Python 缺少依赖。
     let venv_python = dir.join(".venv").join("Scripts").join("python.exe");
     let python = if venv_python.is_file() {
@@ -78,21 +107,27 @@ fn spawn_backend() -> Option<Child> {
         "--port",
         &BACKEND_PORT.to_string(),
     ])
-    .current_dir(&dir)
-    // Windows 默认 GBK；强制 UTF-8，避免读取引擎 JSON / 打印日志时 Unicode 解码失败。
-    .env("PYTHONUTF8", "1")
-    .env("PYTHONIOENCODING", "utf-8")
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
+    .current_dir(dir);
+    hidden(&mut cmd).spawn().ok()
+}
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+/// 安装包模式：直接运行随包分发的 `paperex-server.exe`（内置 Python 运行时）。
+fn spawn_bundled_backend(server: &std::path::Path) -> Option<Child> {
+    let mut cmd = Command::new(server);
+    cmd.args(["--host", "127.0.0.1", "--port", &BACKEND_PORT.to_string()]);
+    if let Some(parent) = server.parent() {
+        cmd.current_dir(parent);
     }
+    hidden(&mut cmd).spawn().ok()
+}
 
-    cmd.spawn().ok()
+/// 拉起 FastAPI 后端：源码模式优先，其次安装包内置后端。
+fn spawn_backend() -> Option<Child> {
+    if let Some(dir) = find_backend_dir() {
+        return spawn_python_backend(&dir);
+    }
+    let server = find_bundled_server()?;
+    spawn_bundled_backend(&server)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

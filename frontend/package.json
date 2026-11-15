@@ -1,7 +1,7 @@
 {
   "name": "paperex",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "paperex — 本地优先的学术论文原位重排双语阅读器",
   "license": "AGPL-3.0-or-later",

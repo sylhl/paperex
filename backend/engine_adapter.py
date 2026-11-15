@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,12 +53,41 @@ ENGINE_FINGERPRINT_FILES = (
 )
 
 
+def _frozen_revision() -> Optional[str]:
+    """Build-time baked engine fingerprint (frozen bundles ship no sources).
+
+    ``build_backend.py`` writes the development-tree fingerprint to
+    ``assets/engine_revision.txt`` so an installed copy reports exactly the
+    same engine revision — and therefore the same cache bucket — as the tree
+    it was built from.
+    """
+    roots = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+    roots.append(Path(sys.executable).resolve().parent / "_internal")
+    roots.append(Path(__file__).resolve().parent)
+    for root in roots:
+        try:
+            value = (root / "assets" / "engine_revision.txt").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if re.fullmatch(r"[0-9a-f]{16}", value):
+            return value
+    return None
+
+
 def engine_fingerprint(engine_dir: Optional[Path] = None) -> str:
     """引擎关键文件 + engine_adapter.py 的 sha256 前 16 位。
 
     同时用于全局译文缓存 bucket（plan §5）与 qa.json 的 engine.revision：
-    引擎/适配层任何关键文件变化都会让旧缓存自然失效。
+    引擎/适配层任何关键文件变化都会让旧缓存自然失效。冻结的桌面安装包里
+    没有源码文件，此时直接返回构建时烘焙的指纹。
     """
+    if getattr(sys, "frozen", False):
+        bundled = _frozen_revision()
+        if bundled:
+            return bundled
     root = Path(engine_dir) if engine_dir is not None else Path(__file__).resolve().parent
     digest = hashlib.sha256()
     for name in ENGINE_FINGERPRINT_FILES:

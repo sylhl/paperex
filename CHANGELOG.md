@@ -5,7 +5,30 @@
 
 ## [Unreleased]
 
-- 无（v1.1.0 之后的变更将记录在此）。
+- 无（v1.2.0 之后的变更将记录在此）。
+
+## [1.2.0] - 2026-11-15
+
+主题：**开箱即用的 Windows 安装包**。本地后端随安装包一起分发，用户无需 Python / Node / 命令行。
+
+### Added
+
+- **Windows 安装包（NSIS）**：`paperex_<version>_x64-setup.exe`，内置 PyInstaller 冻结的本地后端（含 Python 运行时、PyMuPDF、中文字体与 1066 条术语库）。按当前用户安装到 `%LOCALAPPDATA%\paperex`，中英文安装界面，卸载不留残余。
+- **后端打包链**：`backend/packaging/` —— `entry.py` 双模式入口（API 服务 / `--qa-worker`）、`paperex-server.spec`、`build_backend.py`、`smoke_test.py`。冻结包同时承担隔离 QA 子进程，安装环境不需要系统 Python。
+- **引擎指纹烘焙**：构建时把开发树 `engine_fingerprint()` 写入 `assets/engine_revision.txt`；安装版与源码树共享同一缓存 bucket 与 `qa.json` 的 `engine.revision`，避免冻结后源码缺失导致指纹退化。
+- **启动器内置后端探测**：Tauri 启动时先在源码树找 `backend/main.py`（开发模式），找不到再运行安装目录 `backend/paperex-server.exe`（安装包模式）；仍保留端口占用探测与退出时 kill 后端。
+- **一键发布工作流**：`.github/workflows/release.yml` —— 推送 `v*` tag 触发 `windows-latest`：冻结后端 → 冒烟测试 → `tauri build` → 上传安装包与 `SHA256SUMS.txt` → 自动创建 GitHub Release；也支持手动 `workflow_dispatch` 只产出 artifact。
+- **文档**：新增 `docs/RELEASING.md`（本地打包、静默安装验证、版本号清单、Release 流程、常见问题）；README 新增「安装（Windows，推荐）」章节与下载入口。
+
+### Changed
+
+- **版本号 1.2.0**：`backend/main.py`、`frontend/package.json`、`frontend/src-tauri/tauri.conf.json`、`frontend/src-tauri/Cargo.toml`。
+- **Tauri bundle 配置**：`targets` 收敛为 `nsis`；资源映射 `backend/dist/paperex-server/ → backend/`；新增 publisher / homepage / license / category / 中英文安装界面 / currentUser 安装模式。
+- **README**：构建章节拆成「本地开发构建」与「构建安装包」两条路径。
+
+### Fixed
+
+- 无（本版本不改变翻译与排版行为；引擎文件未改动，`engine_fingerprint` 仅因适配层打包分支变化而更新）。
 
 ## [1.1.0] - 2026-11-11
 
@@ -64,5 +87,6 @@
 - 翻译服务：DeepSeek / OpenAI 兼容；可选译后质检（`PAPEREX_POST_QA`，默认关闭）。
 - 已知局限：扫描件需先 OCR、公式以像素+文本层近似保留、任务串行执行。
 
-[Unreleased]: https://github.com/sylhl/paperex/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/sylhl/paperex/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/sylhl/paperex/releases/tag/v1.2.0
 [1.1.0]: https://github.com/sylhl/paperex/releases/tag/v1.1.0

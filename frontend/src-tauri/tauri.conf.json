@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "paperex",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "identifier": "com.paperex.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -30,12 +30,37 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
+    "publisher": "paperex contributors",
+    "homepage": "https://github.com/sylhl/paperex",
+    "copyright": "Copyright (c) 2026 paperex contributors",
+    "licenseFile": "../../LICENSE",
+    "category": "Education",
+    "shortDescription": "本地优先的学术论文原位翻译与双语阅读器",
+    "longDescription": "把英文论文 PDF 原位翻译成中文 PDF：保留公式、图表与版式，内置质量循环与 qa.json 质检报告；本地后端随安装包分发，无需 Python / Node 环境。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../../backend/dist/paperex-server/": "backend/"
+    },
+    "windows": {
+      "allowDowngrades": true,
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "compression": "lzma",
+        "startMenuFolder": "paperex",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true
+      }
+    }
   }
 }

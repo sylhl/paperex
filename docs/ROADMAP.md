@@ -17,7 +17,18 @@
 - **前端 UX**：阶段/ETA/取消、错误卡片、QA 徽标与报告、双栏阅读器、六强调色深浅主题、窄屏适配。
 - **引擎修复**：D1 数字/单位原子化、D2 脚注 NUL 字符、D3 保护区英文段落误判、D4 行内公式丢失、D5 表格保护区 QA 误报、D6 字体别名误报、D7 verify/inspect 页子集参数（增量复检基础，尚未接入质量循环）。
 
-## v1.2（近期方向）
+## v1.2.0（已交付，2026-11-15）
+
+主题：**开箱即用的桌面安装包**。
+
+- **Windows 安装包（NSIS）**：内置 PyInstaller 冻结的本地后端，用户无需 Python / Node；按当前用户安装、中英文界面、卸载干净。
+- **后端打包链**：`backend/packaging/`（双模式入口 `entry.py`、`paperex-server.spec`、`build_backend.py`、`smoke_test.py`）；冻结包同时承担 `--qa-worker` 隔离 QA 子进程。
+- **引擎指纹烘焙**：构建时写入 `assets/engine_revision.txt`，安装版与源码树共享缓存 bucket 与 `qa.json` 的 `engine.revision`。
+- **启动器探测**：源码模式优先 `backend/main.py`，否则运行安装目录的 `backend/paperex-server.exe`。
+- **发布自动化**：`.github/workflows/release.yml`（tag `v*` → 冻结→冒烟→`tauri build`→Release 资产 + SHA256SUMS）。
+- **文档**：`docs/RELEASING.md`；README 新增安装章节。
+
+## v1.3（近期方向）
 
 - **QA 误报治理**：`high_risk_layout` 等高频 warning 的分级与抑制策略；对已确认误报建立回归 fixture，持续降低误报率。
 - **增量 QA**：让质量循环复检只跑受影响页（接入 D7 的 `pages` 参数），把 `strict` 的总耗时压下来。
@@ -25,13 +36,13 @@
 - **术语库编辑**：设置页增删改查术语、导入/导出 CSV、冲突提示；术语变更自动更新缓存分桶。
 - **OCR 体验**：更清晰的安装引导与 `PAPEREX_TESSDATA` 探测；评估随安装包分发 Tesseract 的可行性与许可证影响。
 - **错误自愈**：网络类错误（`provider_unreachable` / 5xx）自动退避重试；断点续跑更细粒度（按页/按块）。
+- **安装包体验**：代码签名（消除 SmartScreen 提示）、自动更新通道、体积优化（字体子集/按需分发）。
 
-## v1.3（中期方向）
+## v1.4（中期方向）
 
 - **公式保真增强**：在现有「像素 + 文本层」基础上评估公式语义保留（LaTeX/MathML 旁路），提升无障碍与可检索性。
 - **排版能力**：复杂多栏、跨页表格、图表标题编号的更强结构感知；更多期刊模板 profile。
 - **并发与吞吐**：从单引擎锁串行走向受控并发（多任务队列 + 资源配额），同时保证内存与质量稳定。
-- **打包与分发**：Windows 安装包（MSI/NSIS）、后端依赖冻结方案、自动更新通道。
 - **跨平台**：macOS / Linux 的 Tauri 构建验证与 CI 覆盖（后端与网页版优先）。
 
 ## 探索 / 待验证

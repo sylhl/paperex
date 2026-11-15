@@ -1,6 +1,6 @@
 /* paperex v1.1 前端常量：存储键、主题、质量档位、任务阶段、QA 标签 */
 
-export const APP_VERSION = '1.1.0'
+export const APP_VERSION = '1.2.0'
 
 export const STORAGE_KEYS = {
   apiBase: 'paperex.apiBase',

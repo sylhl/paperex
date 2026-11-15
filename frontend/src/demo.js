@@ -74,7 +74,7 @@ export const DEMO_QA_REPORT = {
   repair_attempted: true,
   score: { errors: 1, warnings: 3, total: 4 },
   best_score: { errors: 1, warnings: 3, total: 4 },
-  engine: { name: 'paperex-qa', revision: '1.1.0' },
+  engine: { name: 'paperex-qa', revision: '1.2.0' },
   pass_history: [
     { pass: 0, errors: 2, warnings: 7, total: 9 },
     { pass: 1, errors: 1, warnings: 3, total: 4 }

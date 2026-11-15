@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-installer:
+    name: Windows installer
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri -> target
+
+      - name: Create backend virtualenv
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/Scripts/python -m pip install --upgrade pip
+          backend/.venv/Scripts/python -m pip install -r backend/requirements.txt pyinstaller
+
+      - name: Freeze backend (PyInstaller)
+        run: backend/.venv/Scripts/python backend/packaging/build_backend.py
+
+      - name: Smoke-test frozen backend
+        run: backend/.venv/Scripts/python backend/packaging/smoke_test.py
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build MSI/NSIS installer
+        working-directory: frontend
+        run: npm run tauri build
+
+      - name: Collect installer and checksums
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item frontend/src-tauri/target/release/bundle/nsis/*.exe release/
+          Get-ChildItem release/*.exe | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii release/SHA256SUMS.txt
+          Get-ChildItem release | Format-Table Name, Length
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: paperex-windows-x64
+          path: release/
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.exe
+            release/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true

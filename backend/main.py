@@ -135,7 +135,9 @@ def _appdata_root() -> Path:
     base = os.environ.get("APPDATA")
     if not base:
         base = str(Path.home() / "AppData" / "Roaming")
-    return Path(base) / APP_NAME
+    # 规范化路径：Windows 上 APPDATA 有时是 8.3 短名（RUNNER~1），
+    # 而 realpath 校验会返回长名；统一成同一种形式，避免 relative_to 失败。
+    return Path(os.path.realpath(base)) / APP_NAME
 
 
 def _legacy_appdata_root() -> Path:

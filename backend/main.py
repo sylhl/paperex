@@ -38,6 +38,21 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+
+def _ensure_utf8_stdio() -> None:
+    """Keep startup logs from crashing on non-UTF-8 code pages (e.g. cp1252 CI)."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+
+
+_ensure_utf8_stdio()
+
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse

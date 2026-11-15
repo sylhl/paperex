@@ -23,7 +23,7 @@
 
 不想装 Python / Node？直接下载安装包：[**paperex Windows 安装包（Latest）**](https://github.com/sylhl/paperex/releases/latest)。
 
-1. 下载 `paperex_1.2.0_x64-setup.exe`（约 50 MB，**内置本地后端**，无需 Python / Node / 命令行）。
+1. 下载 `paperex-v1.2.0-windows-x64-setup.exe`（约 50 MB，**内置本地后端**，无需 Python / Node / 命令行）。
 2. 双击安装：当前用户安装，默认目录 `%LOCALAPPDATA%\paperex`，可自选路径。
 3. 首次启动若 Windows SmartScreen 提示「Windows 已保护你的电脑」：点「更多信息 → 仍要运行」——安装包未做代码签名，这是预期行为。
 4. 打开应用 → 右上角 ⚙️「设置」填入翻译服务（DeepSeek / OpenAI 兼容 / Anthropic）→ 选择 PDF 即可开始。
@@ -210,7 +210,8 @@ backend/.venv/Scripts/python backend/packaging/smoke_test.py   # 冒烟：dry-ru
 # 2) 打包 NSIS 安装包
 cd frontend
 npm run tauri:build
-# 产物：frontend/src-tauri/target/release/bundle/nsis/paperex_<version>_x64-setup.exe
+# bundler 原始产物：frontend/src-tauri/target/release/bundle/nsis/paperex_<version>_x64-setup.exe
+# Release 工作流会统一重命名为：paperex-v<version>-windows-x64-setup.exe
 ```
 
 完整流程（版本号清单、静默安装验证、GitHub Release 自动化）见 [docs/RELEASING.md](docs/RELEASING.md)。

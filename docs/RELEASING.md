@@ -8,7 +8,7 @@ Python、Node 或任何命令行操作，双击即用。本文档面向维护者
 
 ## 1. 产物结构
 
-安装包（NSIS，`paperex_1.2.0_x64-setup.exe`）安装后的目录：
+安装包（NSIS，Release 资产名为 `paperex-v1.2.0-windows-x64-setup.exe`）安装后的目录：
 
 ```
 %LOCALAPPDATA%\paperex\            # 当前用户安装（installMode=currentUser）
@@ -52,7 +52,8 @@ npm ci
 npm run tauri build
 ```
 
-产物：`frontend/src-tauri/target/release/bundle/nsis/paperex_<version>_x64-setup.exe`。
+产物：`frontend/src-tauri/target/release/bundle/nsis/paperex_<version>_x64-setup.exe`
+（bundler 的原始文件名；发布时由工作流统一重命名为 `paperex-v<version>-windows-x64-setup.exe`）。
 
 构建脚本会自动：
 
@@ -71,7 +72,7 @@ npm run tauri build
 ```powershell
 # 静默安装到临时目录（/S 静默，/D 指定目录且必须是最后一个参数）
 $tmp = "$env:TEMP\paperex-install-test"
-Start-Process .\paperex_1.2.0_x64-setup.exe -ArgumentList "/S", "/D=$tmp" -Wait
+Start-Process .\paperex-v1.2.0-windows-x64-setup.exe -ArgumentList "/S", "/D=$tmp" -Wait
 Get-ChildItem $tmp
 Test-Path "$tmp\backend\paperex-server.exe"   # 应为 True
 
@@ -116,8 +117,8 @@ Test-Path "$tmp\backend\paperex-server.exe"   # 应为 True
 2. `build_backend.py` 冻结后端；
 3. `smoke_test.py` 冒烟测试（内置 dry-run 翻译 + QA 子进程）；
 4. `npm ci` + `npm run tauri build` 生成 NSIS 安装包；
-5. 收集 `*.exe` 与 `SHA256SUMS.txt`，上传工作流 artifact；
-6. `softprops/action-gh-release` 创建/更新 Release 并附带资产。
+5. 收集安装包，统一重命名为 `paperex-v<version>-windows-x64-setup.exe`，上传工作流 artifact；
+6. `softprops/action-gh-release` 创建/更新 Release（标题 `paperex v<version>`）并附带安装包资产。
 
 发布流程：
 
@@ -130,8 +131,14 @@ git push origin v1.2.0
 ```
 
 推送后打开 GitHub → Actions → Release，等待 green；Release 页面会自动附带
-安装包与校验和。`workflow_dispatch` 手动触发只产出 artifact、不建 Release，
-便于先在 PR 上验证打包链路。
+安装包（唯一资产）与 GitHub 原生的 SHA-256 展示。命名约定：
+
+* Release 标题：`paperex v<version>`
+* 安装包资产：`paperex-v<version>-windows-x64-setup.exe`
+* 不再额外上传 `SHA256SUMS.txt` 之类文件——Release 页面每个资产右侧即显示
+  GitHub 计算的 `sha256:`，需要校验时复制该值即可。
+
+`workflow_dispatch` 手动触发只产出 artifact、不建 Release，便于先在 PR 上验证打包链路。
 
 ---
 

@@ -91,7 +91,10 @@ def run_flow(client: httpx.Client, pdf: Path, timeout_s: float) -> dict:
             "quality_mode": "fast",
         },
     )
-    create.raise_for_status()
+    if create.status_code != 200:
+        raise RuntimeError(
+            f"POST /api/jobs returned HTTP {create.status_code}: {create.text[:2000]}"
+        )
     job_id = create.json()["job_id"]
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -219,6 +222,11 @@ def main() -> int:
         print(f"elapsed: {elapsed:.1f}s")
     except RuntimeError as error:
         failures.append(str(error))
+    except Exception as error:  # noqa: BLE001 - report any client/flow failure with server logs
+        import traceback  # noqa: PLC0415
+
+        traceback.print_exc()
+        failures.append(f"{type(error).__name__}: {error}")
     finally:
         try:
             process.terminate()

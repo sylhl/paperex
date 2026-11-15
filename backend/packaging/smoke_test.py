@@ -61,9 +61,14 @@ def make_paper(path: Path) -> None:
     document.close()
 
 
-def wait_health(client: httpx.Client, deadline: float) -> dict:
+def wait_health(client: httpx.Client, deadline: float, process: subprocess.Popen | None = None) -> dict:
     last_error = ""
     while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"backend exited with code {process.returncode} before becoming healthy "
+                f"(last connection error: {last_error})"
+            )
         try:
             response = client.get("/api/health")
             if response.status_code == 200:
@@ -72,7 +77,7 @@ def wait_health(client: httpx.Client, deadline: float) -> dict:
         except httpx.HTTPError as error:  # server still booting
             last_error = str(error)
         time.sleep(0.5)
-    raise SystemExit(f"backend did not become healthy: {last_error}")
+    raise RuntimeError(f"backend did not become healthy within the deadline: {last_error}")
 
 
 def run_flow(client: httpx.Client, pdf: Path, timeout_s: float) -> dict:
@@ -102,6 +107,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="smoke test the frozen paperex backend")
     parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
     parser.add_argument("--timeout", type=float, default=240.0, help="job timeout in seconds")
+    parser.add_argument(
+        "--health-timeout",
+        type=float,
+        default=240.0,
+        help="seconds to wait for the frozen backend to answer /api/health",
+    )
     parser.add_argument("--keep", action="store_true", help="keep the temporary directory")
     args = parser.parse_args()
 
@@ -140,7 +151,7 @@ def main() -> int:
     try:
         base = f"http://127.0.0.1:{port}"
         with httpx.Client(base_url=base, timeout=30.0) as client:
-            health = wait_health(client, time.monotonic() + 120)
+            health = wait_health(client, time.monotonic() + args.health_timeout, process)
             boot_s = time.monotonic() - started
             print(f"health ready in {boot_s:.1f}s: {json.dumps(health, ensure_ascii=False)[:200]}")
 
@@ -206,17 +217,22 @@ def main() -> int:
 
         elapsed = time.monotonic() - started
         print(f"elapsed: {elapsed:.1f}s")
+    except RuntimeError as error:
+        failures.append(str(error))
     finally:
-        process.terminate()
+        try:
+            process.terminate()
+        except OSError:
+            pass
         try:
             process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             process.kill()
         log.close()
-        tail = log_path.read_text(encoding="utf-8", errors="replace")[-1500:]
         if failures:
+            print(f"--- server exit code: {process.returncode} ---", file=sys.stderr)
             print("--- server log tail ---", file=sys.stderr)
-            print(tail, file=sys.stderr)
+            print(log_path.read_text(encoding="utf-8", errors="replace")[-4000:], file=sys.stderr)
 
     if args.keep:
         print(f"artifacts kept at {root}")
